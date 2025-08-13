@@ -619,7 +619,7 @@ def summary(mode: str, resources: dict = None, states: dict = None):
 
 
 @beartype
-def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,interactive-rtx3090,interactive-rtx2080,gpu-h200") -> dict:
+def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,interactive-rtx3090,interactive-rtx2080,gpu-h200,gpu-mig") -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
     Args:
