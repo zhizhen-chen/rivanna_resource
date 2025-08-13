@@ -92,7 +92,7 @@ def get_node_resources(node_name):
     }
 
 def main():
-    partitions = ["gpu-a6000", "gpu-a100-80", "gpu-a100-40", "gpu-a40", "gpu-v100", "interactive"]
+    partitions = ["gpu-a6000", "gpu-a100-80", "gpu-a100-40", "gpu-a40", "gpu-v100", "interactive-rtx3090", "interactive-rtx2080", "gpu-h200",]
     all_resources = []
     
     for partition_name in partitions:

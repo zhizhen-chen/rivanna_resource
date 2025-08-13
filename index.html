@@ -10,81 +10,38 @@
     </script>
 <header>
     <h1>Rivanna Monitor: {{ hostname }}</h1>
-    <button style="float: right;" onclick="ToggleDarkFn()">Toggle Dark Mode</button>
+    <button style="float: right; margin-left: 10px;" onclick="ToggleDarkFn()">Toggle Dark Mode</button>
+    <button style="float: right;" onclick="updateAll()" id="updateButton">Update All</button>
+    <div id="updateStatus" style="float: right; margin-right: 20px; color: #666;"></div>
      
     <script>
-        var dark_mode_enabled = localStorage.getItem('colorScheme');
-        console.log(dark_mode_enabled);
-        if (dark_mode_enabled == null){
-            dark_mode_enabled = false;
+        var dark_mode_enabled = localStorage.getItem('colorScheme') || "false";
+        if (!localStorage.getItem('colorScheme')) {
             localStorage.setItem('colorScheme', dark_mode_enabled);
         }
-        function darkModeChildren(element) {
-            for (var i = 0; i < element.length; i++) {
-                if (dark_mode_enabled === "true"){
-                    if (element[i].className == "progress"){
-                        element[i].style.backgroundColor = "transparent";
-                        element[i].style.color = "black";
-                    }
-                    else {
-                        element[i].style.backgroundColor = "black";
-                        element[i].style.color = "white";
-                    }
-                }
-
-                else {
-                    if (element[i].className == "progress"){
-                        element[i].style.backgroundColor = "transparent";
-                        element[i].style.color = "black";
-                    }
-                    else {
-                        element[i].style.backgroundColor = "#f5f5f5";
-                        element[i].style.color = "black";
-                    }
-                }
-            }
+        function applyThemeStyles() {
+            // 清除所有内联样式，让CSS规则正常工作
+            document.querySelectorAll('table tr, .progress').forEach(function(element) {
+                element.removeAttribute('style');
+            });
         }
 
         function checkColour(){
-            console.log(dark_mode_enabled);
-            if (dark_mode_enabled ==="true"){
-                var element = document.body;
-                element.classList.toggle("dark");
-                darkMode();
-            }
+            document.body.classList.toggle("dark", dark_mode_enabled === "true");
+            // 应用主题样式
+            setTimeout(applyThemeStyles, 100);
         }
 
         function ToggleDarkFn() {
-            var element = document.body;
-            element.classList.toggle("dark");
+            document.body.classList.toggle("dark");
             
-            if (dark_mode_enabled ==="true"){
-                dark_mode_enabled = "false";
-                localStorage.setItem('colorScheme', false);
-            }
-            else{
-                dark_mode_enabled = "true";
-                localStorage.setItem('colorScheme', true);
-            }
-
-            darkMode();
-
+            // 更新状态变量
+            dark_mode_enabled = dark_mode_enabled === "true" ? "false" : "true";
+            localStorage.setItem('colorScheme', dark_mode_enabled);
+            
+            applyThemeStyles();
         }
-        function darkMode() {
-            var tables = ["resource","table_big", "terminal","disk_io", "allocations"];
-
-            for (var i = 0; i < tables.length; i++) {
-                var element = document.querySelectorAll("#"+tables[i]+" tbody tr:nth-child(even)");
-                darkModeChildren(element);
-            }
-
-            var a = document.querySelectorAll(".terminal");
-            darkModeChildren(a);
-
-            var b = document.querySelectorAll(".progress");
-            darkModeChildren(b);
-
-        }   
+        // 删除原来的darkMode函数，使用新的applyThemeStyles   
     </script>
     <h3><div id="clock"></div></h3>
     <hr>
@@ -111,15 +68,8 @@
 
 <hr>
 <details open>
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> GPU Leaderboard by Partition</summary>
-<pre class='terminal' id="leaderboard_partition"> </pre>
-</details>
-<br>
-
-<hr>
-<details open>
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Disk I/O (measured by reading a 512MB file)</summary>
-    <div class='table_big' id='disk_io'> </div>
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Disk Quota</summary>
+    <div class='table_big' id='disk_quota'> </div>
 </details>
 <br>
 
@@ -150,106 +100,101 @@
 
 <!-- Update content every {interval} ms -->
 <script>
-
-    var interval = 1000 * 15;
+    // Remove all setInterval calls and change to manual update
     var clock = document.getElementById("clock");
-    fetch("{{ url_for('time_feed') }}")
-        .then(response => {
-                response.text().then(t => {clock.innerHTML = t;darkMode();})
-            });
-    setInterval(() => {
-        fetch("{{ url_for('time_feed') }}")
-        .then(response => {
-                response.text().then(t => {clock.innerHTML = t;darkMode();})
-            });
-        }, interval);
-
-    var disk_io = document.getElementById("disk_io");
-    fetch("{{ url_for('disk_io') }}")
-        .then(response => {
-                response.text().then(t => {disk_io.innerHTML = t;darkMode();})
-            });
-    setInterval(() => {
-        fetch("{{ url_for('disk_io') }}")
-        .then(response => {
-                response.text().then(t => {disk_io.innerHTML = t;darkMode();})
-            });
-        }, 1000 * 60 * 15);
-
+    var disk_quota = document.getElementById("disk_quota");
     var resource = document.getElementById("resource");
-    fetch("{{ url_for('resource') }}")
-        .then(response => {
-                response.text().then(t => {resource.innerHTML = t;darkMode();})});
-    setInterval(() => {
-        fetch("{{ url_for('resource') }}")
-        .then(response => {
-                response.text().then(t => {resource.innerHTML = t;darkMode();})});
-        }, interval);
-
     var queue = document.getElementById("queue");
-    fetch("{{ url_for('queue') }}")
-        .then(response => {
-                response.text().then(t => {queue.innerHTML = t;darkMode();})
-            });
-    setInterval(() => {
-        fetch("{{ url_for('queue') }}")
-        .then(response => {
-                response.text().then(t => {queue.innerHTML = t;darkMode();})
-            });
-        }, interval);
-    
     var leaderboard = document.getElementById("leaderboard");
-    fetch("{{ url_for('leaderboard') }}")
-        .then(response => {
-                response.text().then(t => {leaderboard.innerHTML = t;darkMode();})
-            });
-    setInterval(() => {
-        fetch("{{ url_for('leaderboard') }}")
-        .then(response => {
-                response.text().then(t => {leaderboard.innerHTML = t;darkMode();})
-            });
-        }, interval);
-
-    var leaderboard_partition = document.getElementById("leaderboard_partition");
-    fetch("{{ url_for('leaderboard_partition') }}")
-        .then(response => {
-                response.text().then(t => {leaderboard_partition.innerHTML = t;darkMode();})
-            });
-    setInterval(() => {
-        fetch("{{ url_for('leaderboard_partition') }}")
-        .then(response => {
-                response.text().then(t => {leaderboard_partition.innerHTML = t;darkMode();})
-            });
-        }, interval);
-
     var allocations = document.getElementById("allocations");
-    fetch("{{ url_for('allocations') }}")
-        .then(response => {
-                response.text().then(t => {allocations.innerHTML = t;darkMode();})
-            });
-    setInterval(() => {
-        fetch("{{ url_for('allocations') }}")
-        .then(response => {
-                response.text().then(t => {allocations.innerHTML = t;darkMode();})
-            });
-        }, interval);
+    var updateButton = document.getElementById("updateButton");
+    var updateStatus = document.getElementById("updateStatus");
 
+    // 页面可见性变化时自动更新
+    document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible') updateAll();
+    });
+
+    // 页面加载时自动更新
+    window.onload = updateAll;
+
+    async function updateAll() {
+        // Disable update button
+        updateButton.disabled = true;
+        updateButton.textContent = "Updating...";
+        updateStatus.textContent = "Starting update...";
+        
+        try {
+            // Update time
+            updateStatus.textContent = "Updating time...";
+            await fetch("{{ url_for('time_feed') }}")
+                .then(response => response.text())
+                .then(t => {clock.innerHTML = t;});
+
+            // Update resource information
+            updateStatus.textContent = "Updating resource info...";
+            await fetch("{{ url_for('resource') }}")
+                .then(response => response.text())
+                .then(t => {resource.innerHTML = t;});
+
+            // Update queue information
+            updateStatus.textContent = "Updating queue info...";
+            await fetch("{{ url_for('queue') }}")
+                .then(response => response.text())
+                .then(t => {queue.innerHTML = t;});
+
+            // Update leaderboard information
+            updateStatus.textContent = "Updating leaderboard...";
+            await fetch("{{ url_for('leaderboard') }}")
+                .then(response => response.text())
+                .then(t => {leaderboard.innerHTML = t;});
+
+            // Update allocation information
+            updateStatus.textContent = "Updating allocations...";
+            await fetch("{{ url_for('allocations') }}")
+                .then(response => response.text())
+                .then(t => {allocations.innerHTML = t;});
+
+            // Update disk quota information
+            updateStatus.textContent = "Updating disk quota...";
+            await fetch("{{ url_for('disk_quota') }}")
+                .then(response => response.text())
+                .then(t => {disk_quota.innerHTML = t;});
+
+            // Update completed
+            updateStatus.textContent = "Update completed!";
+            
+            // 重新应用主题样式
+            setTimeout(applyThemeStyles, 50);
+            
+            setTimeout(() => updateStatus.textContent = "", 2000);
+        } catch (error) {
+            updateStatus.textContent = "Update failed!";
+            console.error("Update error:", error);
+        } finally {
+            // Restore update button
+            updateButton.disabled = false;
+            updateButton.textContent = "Update All";
+        }
+    }
 </script>
 
 <!-- CSS -->
 <style>
     body {
-    font-family: 'Helvetica', 'Arial', sans-serif;
-    max-width: 1200px;
-    margin: auto;
-    zoom: 75%;
-    }.dark{
+        font-family: 'Helvetica', 'Arial', sans-serif;
+        max-width: 1200px;
+        margin: auto;
+        zoom: 75%;
+    }
+
+    body.dark {
         background-color: #222;
         color: #e6e6e6;
     }
 
-    a {
-        color: #007bff;
+    body.dark a {
+        color: #4da6ff;
     }
 
     pre.terminal {
@@ -257,38 +202,67 @@
         background-color: #fafafa;
     }
 
+    body.dark pre.terminal {
+        color: #e6e6e6;
+        background-color: #333;
+    }
+
     table {
         border-collapse: collapse;
         width: 100%;
-    }.dark{
-        background-color: #222;
-        color: #e6e6e6;
     }
 
     .table_big table {
         border-collapse: collapse;
         width: 62%;
         font-size: 18px;
-    }.dark{
-        background-color: #222;
-        color: #e6e6e6;
     }
 
     th, td {
         text-align: left;
         padding: 8px;
     }
+    
+    /* 只对用户列应用文字溢出处理，其他列正常显示 */
+    td:last-child {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 400px;
+    }
 
     tr:nth-child(even) {
         background-color: #f5f5f5;
-    }.dark{
-        background-color: #222;
+    }
+
+    body.dark tr:nth-child(even) {
+        background-color: #333;
         color: #e6e6e6;
+    }
+
+    body.dark progress {
+        background-color: #444;
+        border-color: #555;
+    }
+
+    body.dark progress::-webkit-progress-bar {
+        background-color: #444;
+    }
+
+    body.dark progress::-webkit-progress-value {
+        background-color: #4a90e2;
+    }
+
+    body.dark progress::-moz-progress-bar {
+        background-color: #4a90e2;
+    }
+
+    body.dark .progress {
+        color: #e6e6e6 !important;
     }
 
     progress {
         border-width: 1px;
-        /* border-color: #646464; */
         outline: none;
         border-radius: 3px; 
         width: 100px;
@@ -296,46 +270,26 @@
         box-shadow: 1px 1px 4px rgba(128, 128, 128, 0.2);
         margin-left: 5px;
         background-color: rgb(216, 216, 216);
-        }
-        progress::-webkit-progress-bar {
+    }
+
+    progress::-webkit-progress-bar {
         background-color: rgb(216, 216, 216);
         border-radius: 3px;
-        }
+    }
 
-        progress::-webkit-progress-value {
+    progress::-webkit-progress-value {
         background-color: rgb(155, 224, 207);
         border-radius: 3px;
-        }
+    }
 
-        progress::-moz-progress-bar {
-            background-color: rgb(155, 224, 207);
-            border-radius: 3px;
-        }
+    progress::-moz-progress-bar {
+        background-color: rgb(155, 224, 207);
+        border-radius: 3px;
+    }
 
     progress.long {
-        border-width: 1px;
-        outline: none;
-        /* border-color: #646464; */
-        border-radius: 3px; 
         width: 200px;
-        height: 20px;
-        box-shadow: 1px 1px 4px rgba(128, 128, 128, 0.2);
-        margin-left: 5px;
-        }
-        progress::-webkit-progress-bar {
-        background-color: rgb(216, 216, 216);
-        border-radius: 3px;
-        }.dark{
-            background-color: #222;
-            /* color: #e6e6e6; */
-        }
-        progress::-webkit-progress-value {
-        background-color: rgb(155, 224, 207);
-        border-radius: 3px;
-        }.dark{
-            background-color: #222;
-            /* color: #e6e6e6; */
-        }
+    }
 
     .progress:before {
         content:attr(data-text);
@@ -344,6 +298,7 @@
         right:0;
         top:1px;
     }
+
     .progress {
         text-align:center;
         display:inline-block;
@@ -357,5 +312,29 @@
 
     footer {
         text-align: right;
+    }
+
+    #updateButton {
+        background-color: #4CAF50;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+    }
+
+    #updateButton:hover {
+        background-color: #45a049;
+    }
+
+    #updateButton:disabled {
+        background-color: #cccccc;
+        cursor: not-allowed;
+    }
+
+    #updateStatus {
+        padding: 8px 0;
+        font-style: italic;
     }
 </style>

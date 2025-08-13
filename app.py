@@ -17,12 +17,14 @@ from slurm_gpustat import (
     parse_node_names,
     get_gpu_partitions,
 )
-import gradio as gr
+# import gradio as gr  # Not used in this file
 
 # from https://developer.nvidia.com/cuda-gpus
 # sort gpu by computing power
 # if fail to display other GPU types, add items in the following dictionaries.
 CAPABILITY = {
+    "1g.10gb": 8.0,  # MIG GPU slice
+    "h200": 8.9,
     "a4500": 8.0,  # not sure
     "a100": 8.0,
     "a40": 8.6,
@@ -38,6 +40,9 @@ CAPABILITY = {
     "rtx8k": 7.5,
 }
 GMEM = {
+    "mig": "[11g]",
+    "1g.10gb": "[10g]",  # MIG GPU slice with 10GB memory
+    "h200": "[141g]",
     "a4500": "[20g]",
     "a6000": "[48g]",
     "a40": "[48g]",
@@ -70,9 +75,27 @@ def get_resource_bar(avail, total, text="", long=False):
 
 
 def str_to_int(text):
-    """Convert string with unit to int. e.g. "30 GB" --> 30."""
-
-    return int("".join(c for c in text if c.isdigit()))
+    """Convert string with unit to int in GB. e.g. "30 GB" --> 30, "1.4 T" --> 1400."""
+    # Remove any whitespace
+    text = text.strip()
+    
+    # Split into number and unit
+    parts = text.split()
+    if len(parts) != 2:
+        return 0
+    
+    number = float(parts[0])
+    unit = parts[1].upper()
+    
+    # Convert to GB
+    if unit == 'T':
+        return int(number * 1024)
+    elif unit == 'G':
+        return int(number)
+    elif unit == 'M':
+        return int(number / 1024)
+    else:
+        return 0
 
 
 def parse_leaderboard(sum_by_gmem=[48]):
@@ -530,6 +553,63 @@ def parse_disk_io():
     return table_html
 
 
+def parse_disk_quota():
+    """Run 'hdquota' command and parse the output to an HTML table."""
+    try:
+        output = check_output("hdquota", shell=True).decode("utf-8")
+        lines = output.split('\n')
+        
+        # Create HTML table with headers
+        headers = ["Storage Type", "Location", "Size", "Used", "Avail", "Use%"]
+        table_html = "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+        
+        # Add data rows
+        for line in lines[2:]:  # Skip header and separator lines
+            if not line.strip():
+                continue
+            
+            # Split the line into parts, handling spaces correctly
+            parts = line.split()
+            
+            # Skip lines that don't have enough parts
+            if len(parts) < 9:  # Changed from 10 to 9 to handle single-word storage types
+                continue
+                
+            try:
+                # Handle storage type (could be one or two words)
+                if parts[1] in ["Directory", "Project", "Standard"]:
+                    storage_type = f"{parts[0]} {parts[1]}"
+                    location = parts[2]
+                    size = f"{parts[3]} {parts[4]}"
+                    used = f"{parts[5]} {parts[6]}"
+                    avail = f"{parts[7]} {parts[8]}"
+                    use_percent = parts[9]
+                else:
+                    storage_type = parts[0]
+                    location = parts[1]
+                    size = f"{parts[2]} {parts[3]}"
+                    used = f"{parts[4]} {parts[5]}"
+                    avail = f"{parts[6]} {parts[7]}"
+                    use_percent = parts[8]
+                
+                table_html += "<tr>"
+                table_html += f"<td>{storage_type}</td>"
+                table_html += f"<td>{location}</td>"
+                table_html += f"<td>{size}</td>"
+                table_html += f"<td>{used}</td>"
+                table_html += f"<td>{avail}</td>"
+                table_html += f"<td>{use_percent}</td>"
+                table_html += "</tr>"
+            except IndexError:
+                continue
+        
+        table_html += "</table>"
+        return table_html
+    except Exception as e:
+        error_msg = f"Error getting disk quota information: {str(e)}"
+        return f"<p>{error_msg}</p>"
+
+
 def parse_allocations_to_table():
     """Run 'allocations -a uva_cv_lab' command and parse the output to an HTML table."""
     cmd = "allocations -a uva_cv_lab"
@@ -656,13 +736,11 @@ def main():
 
         return Response(generate(), mimetype="text")
 
-    # FIXME: temporarily disabled disk_io for server maintenance
-    @app.route("/disk_io")
-    def disk_io():
+    @app.route("/disk_quota")
+    def disk_quota():
         def generate():
-            out = parse_disk_io()
+            out = parse_disk_quota()
             yield out
-
         return Response(generate(), mimetype="text")
 
     @app.route("/allocations")

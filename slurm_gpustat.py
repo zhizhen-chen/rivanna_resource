@@ -25,7 +25,7 @@ from collections import defaultdict
 
 import numpy as np
 import colored
-import seaborn as sns
+# import seaborn as sns  # Not used in this file
 import humanize
 import humanfriendly as hf
 from beartype import beartype
@@ -422,7 +422,8 @@ def occupancy_stats_for_node(node: str) -> dict:
                     print(f"Missing information for {node}: {key}, skipping....")
                     metrics[key] = {}
                 else:
-                    metrics[key] = {x.split("=")[0]: x.split("=")[1] for x in tokens}
+                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1] 
+                                   for token in tokens if "=" in token}
     occupancy = {}
     for metric, alloc_val in metrics["AllocTRES"].items():
         cfg_val = metrics["CfgTRES"][metric]
@@ -437,13 +438,14 @@ def occupancy_stats_for_node(node: str) -> dict:
     return occupancy
 
 def format_size(size_in_bytes):
+    """Format size in bytes to human readable string (G or T)."""
     size_in_gb = size_in_bytes / (1024 ** 3)  
     if size_in_gb < 1024: 
         return f"{int(size_in_gb)} G"
-    else:
-        size_in_tb = size_in_gb / 1024
-        formatted_tb = f"{size_in_tb:.1f}".rstrip('0').rstrip('.')
-        return f"{formatted_tb} T"
+    
+    size_in_tb = size_in_gb / 1024
+    formatted_tb = f"{size_in_tb:.1f}".rstrip('0').rstrip('.')
+    return f"{formatted_tb} T"
 
 def lru_cache_time(seconds, maxsize=None):
     """
@@ -494,12 +496,13 @@ def avail_stats_for_node(node: str) -> dict:
                     # print(f"Missing information for {node}: {key}, skipping....")
                     metrics[key] = {}
                 else:
-                    metrics[key] = {x.split("=")[0]: x.split("=")[1] for x in tokens}
+                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1] 
+                                   for token in tokens if "=" in token}
     occupancy = {}
     for metric, cfg_val in metrics["CfgTRES"].items():
         try:
             alloc_val = metrics["AllocTRES"][metric]
-        except:
+        except KeyError:
             alloc_val = '0'
         if metric == "mem":
             # SLURM appears to sometimes misformat large numbers, producing summary strings
@@ -539,7 +542,8 @@ def parse_all_gpus(partition: Optional[str] = None,
 
     # Debug the regular expression below at
     # https://regex101.com/r/RHYM8Z/3
-    p = re.compile(r'gpu:(?:(\w*):)?(\d*)(?:\(\S*\))?\s*')
+    # Updated regex to support MIG GPU types like "1g.10gb" which contain dots
+    p = re.compile(r'gpu:(?:([^:]*):)?(\d*)(?:\(\S*\))?\s*')
 
     for row in rows:
         node_str, resource_strs = row.split("|")
@@ -615,7 +619,7 @@ def summary(mode: str, resources: dict = None, states: dict = None):
 
 
 @beartype
-def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,interactive-rtx3090,interactive-rtx2080") -> dict:
+def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,interactive-rtx3090,interactive-rtx2080,gpu-h200") -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
     Args:

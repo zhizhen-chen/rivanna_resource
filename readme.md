@@ -11,6 +11,8 @@ This project extends the original implementation developed for the [Visual Geome
 ![Slurm Web Example](slurm_web_example.png)
 
 ## News
+- [08/12/2025]: Add multi instance gpu 
+- [04/29/2025]: Add disk quota, H200 partition, and manual update button.
 - [10/31/2024]: Add allocations.
 - [10/31/2024]: Launched customized version for UVA Rivanna.
 
@@ -37,7 +39,7 @@ python slurm_web/slurm_gpustat.py
 
 Alternatively, add this alias to your `.bash_profile`:
 ```
-alias slurm_gpustat=‘python ~/slurm_web/slurm_gpustat.py’
+alias slurm_gpustat='python ~/slurm_web/slurm_gpustat.py'
 ```
 
 To view the statistics of only the available resources, run:
