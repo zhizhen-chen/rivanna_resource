@@ -635,16 +635,6 @@ def parse_allocations_to_table():
     if not allocation_lines:
         return "<p>No allocation data found.</p>"
 
-    # Define column positions based on the allocation table format
-    col_positions = [
-        (0, 12),  # Description
-        (12, 31),  # StartTime
-        (32, 42),  # EndTime
-        (43, 54),  # Allocated
-        (54, 65),  # Remaining
-        (66, 77),  # PercentUsed
-        (78, 82),  # Active
-    ]
     columns = [
         "Description",
         "StartTime",
@@ -661,19 +651,27 @@ def parse_allocations_to_table():
         table_html += f"<th>{col}</th>"
     table_html += "</tr>"
 
-    # Parse each data row using the column positions
+    # Parse each data row by splitting on whitespace
     for row in allocation_lines:
+        parts = row.split()
+        if len(parts) < 7:
+            continue  # Skip rows that don't have all columns
+
         table_html += "<tr>"
-        for start, end in col_positions:
-            if end is not None:
-                value = row[start:end].strip()
-            else:
-                value = row[start:].strip()
-            table_html += f"<td>{value}</td>"
-            if value == "True":
-                break
-        if value == "True":
-            break
+        # Description
+        table_html += f"<td>{parts[0]}</td>"
+        # StartTime (date and time)
+        table_html += f"<td>{parts[1]} {parts[2]}</td>"
+        # EndTime
+        table_html += f"<td>{parts[3]}</td>"
+        # Allocated
+        table_html += f"<td>{parts[4]}</td>"
+        # Remaining
+        table_html += f"<td>{parts[5]}</td>"
+        # PercentUsed
+        table_html += f"<td>{parts[6]}</td>"
+        # Active
+        table_html += f"<td>{parts[7]}</td>"
         table_html += "</tr>"
 
     table_html += "</table>"
