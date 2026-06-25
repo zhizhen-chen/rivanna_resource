@@ -54,6 +54,19 @@
 <div id="resource"> </div>
 <br>
 
+<!-- SBATCH template modal -->
+<div id="slurmModal" style="display:none;" onclick="if(event.target===this)closeSlurmModal()">
+  <div id="slurmModalBox">
+    <div id="slurmModalHeader">
+      <span id="slurmModalTitle">SBATCH Template</span>
+      <button onclick="closeSlurmModal()" title="Close">&times;</button>
+    </div>
+    <p id="slurmModalDesc" style="margin:0 0 8px 0; color:#888; font-size:0.9em;"></p>
+    <pre id="slurmModalCode"></pre>
+    <button id="slurmCopyBtn" onclick="copySlurmTemplate()">Copy to clipboard</button>
+  </div>
+</div>
+
 <!-- <hr>
 <h2> CPUs available:</h2>
 <div id="cpu_resource"> </div>
@@ -75,7 +88,7 @@
 
 <hr>
 <details open>
-    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Allocations for uva_cv_lab</summary>
+    <summary style="cursor: pointer;font-size:1.5em;font-weight: bold;margin-block-start: 0.83em;margin-block-end: 0.83em;"> Allocations</summary>
     <div class='table_big' id='allocations'> </div>
 </details>
 <br>
@@ -91,9 +104,11 @@
 
 <footer>
     <hr>
-    <p>Source code: <a href="https://github.com/UVA-Computer-Vision-Lab/rivanna_resource"
-        >https://github.com/UVA-Computer-Vision-Lab/rivanna_resource</a>
-    <p>Contact: Xuweiyi Chen (xuweic@email.virginia.edu) </p>
+    <p>Source code: <a href="https://github.com/zhizhen-chen/rivanna_resource"
+        >https://github.com/zhizhen-chen/rivanna_resource</a>
+        (forked from <a href="https://github.com/UVA-Computer-Vision-Lab/rivanna_resource"
+        >UVA-Computer-Vision-Lab/rivanna_resource</a>)
+    <p>Contact: Zhizhen Chen (zzchen@email.virginia.edu)</p>
 </footer>
 
 </html>
@@ -177,6 +192,48 @@
             updateButton.textContent = "Update All";
         }
     }
+
+    function showSlurmTemplate(gpuType) {
+        var modal = document.getElementById("slurmModal");
+        var title = document.getElementById("slurmModalTitle");
+        var desc  = document.getElementById("slurmModalDesc");
+        var code  = document.getElementById("slurmModalCode");
+        var btn   = document.getElementById("slurmCopyBtn");
+
+        title.textContent = "SBATCH Template — " + gpuType;
+        desc.textContent  = "Loading...";
+        code.textContent  = "";
+        btn.textContent   = "Copy to clipboard";
+        modal.style.display = "flex";
+
+        fetch("/slurm_template/" + encodeURIComponent(gpuType))
+            .then(r => r.json())
+            .then(data => {
+                desc.textContent = data.avail + " / " + data.total +
+                    " GPUs currently available. Edit values below as needed, then copy.";
+                code.textContent = data.template;
+            })
+            .catch(() => {
+                desc.textContent = "Failed to load template.";
+            });
+    }
+
+    function closeSlurmModal() {
+        document.getElementById("slurmModal").style.display = "none";
+    }
+
+    function copySlurmTemplate() {
+        var text = document.getElementById("slurmModalCode").textContent;
+        navigator.clipboard.writeText(text).then(() => {
+            var btn = document.getElementById("slurmCopyBtn");
+            btn.textContent = "Copied!";
+            setTimeout(() => btn.textContent = "Copy to clipboard", 2000);
+        });
+    }
+
+    document.addEventListener("keydown", function(e) {
+        if (e.key === "Escape") closeSlurmModal();
+    });
 </script>
 
 <!-- CSS -->
@@ -336,5 +393,85 @@
     #updateStatus {
         padding: 8px 0;
         font-style: italic;
+    }
+
+    /* SBATCH template modal */
+    #slurmModal {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.55);
+        z-index: 1000;
+        align-items: center;
+        justify-content: center;
+    }
+
+    #slurmModalBox {
+        background: #fff;
+        border-radius: 8px;
+        padding: 24px 28px;
+        max-width: 680px;
+        width: 92%;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        position: relative;
+    }
+
+    body.dark #slurmModalBox {
+        background: #2a2a2a;
+        color: #e6e6e6;
+    }
+
+    #slurmModalHeader {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+    }
+
+    #slurmModalTitle {
+        font-size: 1.15em;
+        font-weight: bold;
+    }
+
+    #slurmModalHeader button {
+        background: none;
+        border: none;
+        font-size: 1.5em;
+        cursor: pointer;
+        line-height: 1;
+        color: inherit;
+        padding: 0 4px;
+    }
+
+    #slurmModalCode {
+        background: #f4f4f4;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        padding: 14px;
+        font-size: 0.88em;
+        overflow-x: auto;
+        white-space: pre;
+        margin: 10px 0 14px 0;
+    }
+
+    body.dark #slurmModalCode {
+        background: #1e1e1e;
+        border-color: #444;
+        color: #d4d4d4;
+    }
+
+    #slurmCopyBtn {
+        background: #4CAF50;
+        color: white;
+        border: none;
+        padding: 8px 18px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.95em;
+        transition: background-color 0.2s;
+    }
+
+    #slurmCopyBtn:hover {
+        background: #45a049;
     }
 </style>

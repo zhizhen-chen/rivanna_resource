@@ -517,6 +517,119 @@ def avail_stats_for_node(node: str) -> dict:
     return occupancy
 
 
+def gpu_alloc_by_node() -> dict:
+    """Query SLURM for GPU allocation on every node via scontrol.
+
+    Uses AllocTRES/CfgTRES (authoritative SLURM allocation data) together with
+    the Gres field (for GPU type).  This avoids partition-list filtering and
+    correctly reflects all running/reserved allocations regardless of which
+    partition the job was submitted to.
+
+    Returns:
+        dict mapping node_name -> list of dicts with keys:
+            "type"  : gpu type string (e.g. "b200", "a100")
+            "alloc" : number of GPUs currently allocated
+            "total" : total GPUs configured on the node
+    """
+    rows = parse_cmd("scontrol show node -o")
+    result = {}
+    for row in rows:
+        fields = {}
+        for token in row.split():
+            if "=" in token:
+                key, _, val = token.partition("=")
+                fields[key] = val
+
+        node = fields.get("NodeName")
+        if not node:
+            continue
+
+        # Parse GPU type from Gres field: "gpu:b200:8(S:0-119)" or "gpu:a100:8"
+        # Strip parenthesised CPU affinity BEFORE splitting on comma, because the
+        # affinity string itself contains commas: e.g. "(S:16-31,48-63,80-95)"
+        gres_raw = re.sub(r'\([^)]*\)', '', fields.get("Gres", ""))
+        gpu_type = None
+        gpu_total = 0
+        for gres_part in gres_raw.split(","):
+            if not gres_part.startswith("gpu:"):
+                continue
+            parts = gres_part.split(":")
+            # gpu:<type>:<count>  or  gpu:<count>
+            if len(parts) == 3:
+                gpu_type = parts[1]
+                try:
+                    gpu_total = int(parts[2])
+                except ValueError:
+                    gpu_total = 0
+            elif len(parts) == 2:
+                gpu_type = None
+                try:
+                    gpu_total = int(parts[1])
+                except ValueError:
+                    gpu_total = 0
+
+        if gpu_total == 0:
+            continue  # no GPU on this node
+
+        # For GPU types where the Gres name is generic (e.g. "a100"), use
+        # AvailableFeatures to pick the most specific variant tag so that
+        # different memory tiers are shown as separate rows in the UI.
+        # Priority order: prefer the most specific match (longest tag wins).
+        if gpu_type is not None:
+            features_raw = fields.get("AvailableFeatures", "")
+            feature_tags = [f.strip() for f in features_raw.split(",") if f.strip()]
+            variant_tags = [f for f in feature_tags
+                            if f.startswith(gpu_type + "_") and f != gpu_type]
+            if variant_tags:
+                gpu_type = max(variant_tags, key=len)
+
+        # Skip nodes that are only in restricted partitions not open for general use
+        partitions = fields.get("Partitions", "")
+        partition_list = [p.strip() for p in partitions.split(",") if p.strip()]
+        if partition_list and all(p == "dedicated" for p in partition_list):
+            continue
+
+        # Parse allocated GPU count from AllocTRES
+        alloc_tres = fields.get("AllocTRES", "")
+        gpu_alloc = 0
+        for item in alloc_tres.split(","):
+            if item.startswith("gres/gpu="):
+                try:
+                    gpu_alloc = int(item.split("=", 1)[1])
+                except ValueError:
+                    gpu_alloc = 0
+                break
+
+        # Parse total CPU and memory from CfgTRES for SBATCH template generation
+        cfg_tres = fields.get("CfgTRES", "")
+        cpu_total = 0
+        mem_total_mb = 0
+        for item in cfg_tres.split(","):
+            if item.startswith("cpu="):
+                try:
+                    cpu_total = int(item.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif item.startswith("mem="):
+                mem_str = item.split("=", 1)[1]
+                try:
+                    mem_total_mb = int(hf.parse_size(mem_str, binary=True) // (1024 * 1024))
+                except Exception:
+                    pass
+
+        result[node] = [{
+            "type": gpu_type if gpu_type else "unknown",
+            "alloc": gpu_alloc,
+            "total": gpu_total,
+            "partition": fields.get("Partitions", "gpu"),
+            "features": fields.get("AvailableFeatures", ""),
+            "cpu_total": cpu_total,
+            "mem_total_mb": mem_total_mb,
+        }]
+
+    return result
+
+
 @beartype
 def parse_all_gpus(partition: Optional[str] = None,
                    default_gpus: int = 4,
@@ -619,11 +732,17 @@ def summary(mode: str, resources: dict = None, states: dict = None):
 
 
 @beartype
-def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-a100-80,gpu-a100-40,gpu-a6000,interactive-rtx3090,interactive-rtx2080,gpu-h200,gpu-mig") -> dict:
+def gpu_usage(resources: dict, partition: Optional[str] = None) -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
+    GPU counts come from scontrol AllocTRES (authoritative) via gpu_alloc_by_node().
+    This function uses squeue only to attach user identity and interactive-bash
+    flags to each (node, gpu_type) pair, so no partition list needs to be
+    maintained here.
+
     Args:
-        resources (dict :: None): a summary of cluster resources, organised by node name.
+        resources: a summary of cluster resources, organised by node name.
+        partition: optional partition filter for squeue (default: no filter).
 
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
@@ -631,10 +750,10 @@ def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-
     version_cmd = "sinfo -V"
     slurm_version = parse_cmd(version_cmd, split=False).split(" ")[1]
     if slurm_version.startswith("17"):
-       resource_flag = "gres"
+        resource_flag = "gres"
     else:
-       resource_flag = "tres-per-node"
-    
+        resource_flag = "tres-per-node"
+
     if int(slurm_version[0:2]) >= 21:
         gpu_identifier = 'gres/gpu'
     else:
@@ -645,10 +764,12 @@ def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-
         cmd += f" --partition={partition}"
     detailed_job_cmd = "scontrol show jobid -dd %s"
     rows = parse_cmd(cmd)
-    usage = defaultdict(dict)
+
+    # node -> list of (user, num_gpus, is_bash) from squeue
+    node_user_map = defaultdict(list)
     for row in rows:
         tokens = row.split()
-        # ignore pending jobs
+        # ignore pending jobs (no nodelist) or non-GPU jobs
         if len(tokens) < 4 or not tokens[0].startswith(gpu_identifier):
             continue
         gpu_count_str, node_str, user, jobid = tokens
@@ -656,38 +777,29 @@ def gpu_usage(resources: dict, partition: Optional[str] = "gpu-a40,gpu-v100,gpu-
         if not gpu_count_tokens[-1].isdigit():
             gpu_count_tokens.append("1")
         num_gpus = int(gpu_count_tokens[-1])
-        # get detailed job information, to check if using bash
         detailed_output = parse_cmd(detailed_job_cmd % jobid, split=False)
-        
-        is_bash = any([f'Command={x}\n' in detailed_output for x in INTERACTIVE_CMDS])
-        num_bash_gpus = num_gpus * is_bash
-        node_names = parse_node_names(node_str)
-        for node_name in node_names:
-            # If a node still has jobs running but is draining, it will not be present
-            # in the "available" resources, so we ignore it
-            if node_name not in resources:
-                continue
-            node_gpu_types = [x["type"] for x in resources[node_name]]
-            if (len(gpu_count_tokens) == 2) or (int(slurm_version[0:2]) >= 21):
-                gpu_type = None
-            elif len(gpu_count_tokens) == 3:
-                gpu_type = gpu_count_tokens[1]
-            if gpu_type is None:
-                if len(node_gpu_types) != 1:
-                    gpu_type = sorted(
-                        resources[node_name],
-                        key=lambda k: k['count'],
-                        reverse=True
-                    )[0]['type']
-                    msg = (f"cannot determine node gpu type for {user} on {node_name}"
-                           f" (guessing {gpu_type})")
-                    print(f"WARNING >>> {msg}")
-                else:
-                    gpu_type = node_gpu_types[0]
+        is_bash = any(f'Command={x}\n' in detailed_output for x in INTERACTIVE_CMDS)
+        for node_name in parse_node_names(node_str):
+            node_user_map[node_name].append((user, num_gpus, is_bash))
+
+    # Build usage dict keyed by user, gpu_type, node_name
+    # GPU counts are taken from resources (which is built from scontrol AllocTRES
+    # via gpu_alloc_by_node in the callers), distributed proportionally across
+    # users on the same node.
+    usage = defaultdict(dict)
+    for node_name, user_entries in node_user_map.items():
+        if node_name not in resources:
+            continue
+        node_gpu_types = [x["type"] for x in resources[node_name]]
+        gpu_type = node_gpu_types[0] if len(node_gpu_types) == 1 else sorted(
+            resources[node_name], key=lambda k: k['count'], reverse=True
+        )[0]['type']
+
+        for user, num_gpus, is_bash in user_entries:
+            num_bash_gpus = num_gpus * is_bash
             if gpu_type in usage[user]:
                 usage[user][gpu_type][node_name]['n_gpu'] += num_gpus
                 usage[user][gpu_type][node_name]['bash_gpu'] += num_bash_gpus
-
             else:
                 usage[user][gpu_type] = defaultdict(lambda: {'n_gpu': 0, 'bash_gpu': 0})
                 usage[user][gpu_type][node_name]['n_gpu'] += num_gpus

@@ -11,6 +11,7 @@ This project extends the original implementation developed for the [Visual Geome
 ![Slurm Web Example](slurm_web_example.png)
 
 ## News
+- [06/24/2026]: Add slurm template; Fix the bug that planned/reserved GPUs were not showing as being in use; The allocations now are obtained based on user personal information; Add dynamic GPU partitions.
 - [08/12/2025]: Add Multi-Instance GPU partition
 - [04/29/2025]: Add disk quota, H200 partition, and manual update button.
 - [10/31/2024]: Add allocations.

@@ -10,6 +10,7 @@ from slurm_gpustat import (
     resource_by_type,
     parse_all_gpus,
     gpu_usage,
+    gpu_alloc_by_node,
     node_states,
     INACCESSIBLE,
     parse_cmd,
@@ -18,44 +19,6 @@ from slurm_gpustat import (
     get_gpu_partitions,
 )
 # import gradio as gr  # Not used in this file
-
-# from https://developer.nvidia.com/cuda-gpus
-# sort gpu by computing power
-# if fail to display other GPU types, add items in the following dictionaries.
-CAPABILITY = {
-    "1g.10gb": 8.0,  # MIG GPU slice
-    "h200": 8.9,
-    "a4500": 8.0,  # not sure
-    "a100": 8.0,
-    "a40": 8.6,
-    "a30": 8.0,
-    "a10": 8.6,
-    "a16": 8.6,
-    "v100": 7.0,
-    "gv100gl": 7.0,
-    "v100s": 7.0,
-    "p40": 6.1,
-    "m40": 5.2,
-    "rtx6k": 7.5,
-    "rtx8k": 7.5,
-}
-GMEM = {
-    "mig": "[11g]",
-    "1g.10gb": "[10g]",  # MIG GPU slice with 10GB memory
-    "h200": "[141g]",
-    "a4500": "[20g]",
-    "a6000": "[48g]",
-    "a40": "[48g]",
-    "a30": "[24g]",
-    "v100": "[16g]",
-    "gv100gl": "[32g]",
-    "v100s": "[32g]",
-    "p40": "[24g]",
-    "m40": "[12/24g]",
-    "rtx6k": "[24g]",
-    "rtx8k": "[48g]",
-}
-OLD_GPU_TYPES = ["p40", "m40"]
 
 
 def get_resource_bar(avail, total, text="", long=False):
@@ -122,19 +85,9 @@ def parse_leaderboard(sum_by_gmem=[48]):
         total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
         user_summary = [
             f"{key}={val}"
-            for key, val in sorted(
-                subdict["n_gpu"].items(),
-                key=lambda x: CAPABILITY.get(x[0], 10.0),
-                reverse=True,
-            )
+            for key, val in sorted(subdict["n_gpu"].items(), key=lambda x: x[0])
         ]
         summary_str = "".join([f"{i:12s}" for i in user_summary])
-        num_new_gpus = [
-            val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
-        ]
-        for gm in sum_by_gmem:
-            total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
-        total += f"|newer={str(sum(num_new_gpus)):2s}"
         total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
         out += f"{user:12s}[{total}]    {summary_str}\n"
     return out
@@ -168,19 +121,9 @@ def parse_leaderboard_by_partition(sum_by_gmem=[48]):
             total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
             user_summary = [
                 f"{key}={val}"
-                for key, val in sorted(
-                    subdict["n_gpu"].items(),
-                    key=lambda x: CAPABILITY.get(x[0], 10.0),
-                    reverse=True,
-                )
+                for key, val in sorted(subdict["n_gpu"].items(), key=lambda x: x[0])
             ]
             summary_str = "".join([f"{i:12s}" for i in user_summary])
-            num_new_gpus = [
-                val for key, val in subdict["n_gpu"].items() if key not in OLD_GPU_TYPES
-            ]
-            for gm in sum_by_gmem:
-                total += f"|{gm}g={str(sum([val for key, val in subdict['n_gpu'].items() if key in GMEM and GMEM[key] == f'[{gm}g]'])):2s}"
-            total += f"|newer={str(sum(num_new_gpus)):2s}"
             total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
             out += f"{user:12s}[{total}]    {summary_str}\n"
     out += "=" * 64 + "\n"
@@ -334,26 +277,107 @@ def parse_cpu_usage_to_table(partition="compute", show_bar=True):
     return table_html
 
 
+def build_slurm_template(gpu_type: str, alloc_data: dict) -> str:
+    """Generate a SBATCH script header for the given GPU type.
+
+    Picks the representative node (most common config) and fills in
+    partition, constraint/feature, GPU name, and per-node CPU/mem totals.
+    Values the user should customise (num GPUs, CPUs, mem, time) are left
+    with placeholder comments so the intent is obvious.
+    """
+    nodes = [
+        specs[0] for specs in alloc_data.values()
+        if specs and specs[0]["type"] == gpu_type
+    ]
+    if not nodes:
+        return f"# No nodes found for GPU type: {gpu_type}"
+
+    # Use first node as representative (they share the same hardware config)
+    rep = nodes[0]
+    partition = rep.get("partition", "gpu")
+    features = rep.get("features", gpu_type)
+    cpu_total = rep.get("cpu_total", 0)
+    mem_total_mb = rep.get("mem_total_mb", 0)
+    gpu_total = rep.get("total", 1)
+
+    # The constraint tag is exactly gpu_type (which may already be the specific
+    # variant like "a100_80gb"). The gres name must be the base hardware name
+    # that SLURM knows (e.g. "a100", not "a100_80gb"); strip any _<suffix> that
+    # corresponds to a memory/variant tag so the gres line stays valid.
+    constraint_tag = gpu_type
+    # Derive the base gres name: if features contains the bare GPU name without
+    # the variant suffix, use that; otherwise strip the last _<word> segment.
+    feature_list = [f.strip() for f in features.split(",") if f.strip()]
+    # e.g. features="a100,a100_80gb,gpupod" -> bare_name="a100"
+    bare_candidates = [f for f in feature_list
+                       if gpu_type.startswith(f + "_") or f == gpu_type.split("_")[0]]
+    gres_name = bare_candidates[0] if bare_candidates else gpu_type
+
+    mem_per_gpu_gb = (mem_total_mb // 1024) // gpu_total if gpu_total else 0
+    cpu_per_gpu = cpu_total // gpu_total if gpu_total else 0
+
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --gres=gpu:{gres_name}:1          # number of GPUs (max {gpu_total} per node)",
+        f"#SBATCH --constraint={constraint_tag}",
+        f"#SBATCH --cpus-per-task={cpu_per_gpu}    # CPUs per GPU (max {cpu_total} per node)",
+        f"#SBATCH --mem={mem_per_gpu_gb}G           # memory per job (max {mem_total_mb // 1024}G per node)",
+        "#SBATCH --time=1-00:00:00                  # wall time (D-HH:MM:SS)",
+        "#SBATCH --account=<your_account>           # your Slurm account/allocation",
+        "#SBATCH --job-name=my_job",
+        "#SBATCH --output=%x-%j.out",
+        "",
+        "# ---- load modules / activate environment ----",
+        "module purge",
+        "# module load cuda/12.x",
+        "",
+        "# ---- your commands ----",
+        "python train.py",
+    ]
+    return "\n".join(lines)
+
+
+def get_slurm_template_json(gpu_type: str) -> dict:
+    """Return the SBATCH template and node-count info for a GPU type as a dict."""
+    alloc_data = gpu_alloc_by_node()
+    nodes = [s[0] for s in alloc_data.values() if s and s[0]["type"] == gpu_type]
+    template = build_slurm_template(gpu_type, alloc_data)
+    avail = sum(max(s[0]["total"] - s[0]["alloc"], 0) for s in alloc_data.values()
+                if s and s[0]["type"] == gpu_type)
+    total = sum(s[0]["total"] for s in alloc_data.values()
+                if s and s[0]["type"] == gpu_type)
+    return {"gpu_type": gpu_type, "avail": avail, "total": total, "template": template}
+
+
 def parse_usage_to_table(show_bar=True):
-    """Request sinfo, parse the output to a html table."""
+    """Request sinfo/scontrol, parse the output to a html table."""
 
-    resources = parse_all_gpus()
+    # scontrol AllocTRES is the authoritative source for GPU allocation;
+    # it covers all partitions without a hardcoded list.
+    alloc_data = gpu_alloc_by_node()
     states = node_states()
-    res = {
-        key: val
-        for key, val in resources.items()
-        if states.get(key, "down") not in INACCESSIBLE
-    }
-    res_total = copy.deepcopy(res)
-    usage = gpu_usage(resources=res)
 
-    for subdict in usage.values():
-        for gpu_type, node_dicts in subdict.items():
-            for node_name, user_gpu_count in node_dicts.items():
-                resource_idx = [x["type"] for x in res[node_name]].index(gpu_type)
-                count = res[node_name][resource_idx]["count"]
-                count = max(count - user_gpu_count["n_gpu"], 0)
-                res[node_name][resource_idx]["count"] = count
+    # Filter out inaccessible nodes
+    alloc_data = {
+        node: specs
+        for node, specs in alloc_data.items()
+        if states.get(node, "down") not in INACCESSIBLE
+    }
+
+    # Build res_total (total GPUs) and res (available GPUs) in the same shape
+    # as the old parse_all_gpus() output so the rest of the function is unchanged.
+    res_total = {
+        node: [{"type": s["type"], "count": s["total"]} for s in specs]
+        for node, specs in alloc_data.items()
+    }
+    res = {
+        node: [{"type": s["type"], "count": max(s["total"] - s["alloc"], 0)} for s in specs]
+        for node, specs in alloc_data.items()
+    }
+
+    # gpu_usage() is still used to get user-per-node info (squeue, no partition filter)
+    usage = gpu_usage(resources=res_total)
 
     res_total_by_type = resource_by_type(res_total)
     res_usage_by_type = resource_by_type(res)
@@ -362,12 +386,7 @@ def parse_usage_to_table(show_bar=True):
     total_gpu_count = 0
     avail_gpu_count = 0
 
-    # sort gpus from new to old
-    type_list = sorted(
-        list(res_total_by_type.keys()),
-        key=lambda x: CAPABILITY.get(x, 10.0),
-        reverse=True,
-    )
+    type_list = sorted(res_total_by_type.keys())
 
     # writing the html table
     num_col = None
@@ -429,9 +448,15 @@ def parse_usage_to_table(show_bar=True):
             type_bar = (
                 f"{sum(gpu_count_avail.values())}/{sum(gpu_count_total.values())}"
             )
+        gpu_label = (
+            f'<a href="#" onclick="showSlurmTemplate(\'{gpu_type}\'); return false;"'
+            f' title="Click to generate SBATCH template"'
+            f' style="text-decoration:underline dotted; cursor:pointer;">'
+            f'{gpu_type}</a>'
+        )
         type_summary = (
             f'<tr><td colspan="{max(num_col)}"><b>'
-            f'{gpu_type} {GMEM.get(gpu_type, "")}: {type_bar} gpus available</b></td></tr>'
+            f'{gpu_label}: {type_bar} gpus available</b></td></tr>'
         )
         table_html.append(type_summary)
         table_html.extend(node_summaries)
@@ -610,73 +635,98 @@ def parse_disk_quota():
         return f"<p>{error_msg}</p>"
 
 
-def parse_allocations_to_table():
-    """Run 'allocations -a uva_cv_lab' command and parse the output to an HTML table."""
-    cmd = "allocations -a uva_cv_lab"
-    output = parse_cmd(cmd)
-    if not output:
-        return "<p>No allocation information found.</p>"
+def get_my_accounts():
+    """Return the list of accounts the current user belongs to via 'allocations'."""
+    try:
+        raw = parse_cmd("allocations", split=False)
+    except Exception:
+        return []
+    accounts = []
+    for line in raw.splitlines()[2:]:  # skip header and separator
+        if not line.strip():
+            break  # blank line marks end of account table
+        accounts.append(line.split()[0])
+    return accounts
 
-    # The output has a header, separator, and data rows
-    allocation_lines = []
-    separator_count = 0
-    for line in output:
+
+def parse_allocation_for_account(account):
+    """Parse 'allocations -a <account>' and return an HTML block for that account."""
+    try:
+        raw = check_output(f"allocations -a {account}", shell=True).decode("utf-8")
+    except Exception:
+        return f"<p>Error fetching allocation for {account}.</p>"
+
+    if not raw.strip():
+        return f"<p>No allocation information found for {account}.</p>"
+
+    # Split into sections on blank lines; skip header/separator lines
+    sections = []
+    current = []
+    for line in raw.splitlines():
         if "------" in line:
-            separator_count += 1
             continue
-        if separator_count == 0:
-            continue  # Skip lines before the first separator
-        elif separator_count == 1:
-            if line.strip():
-                allocation_lines.append(line.rstrip("\n"))
+        if not line.strip():
+            if current:
+                sections.append(current)
+                current = []
         else:
-            break  # Stop after the allocation table
+            current.append(line)
+    if current:
+        sections.append(current)
 
-    if not allocation_lines:
-        return "<p>No allocation data found.</p>"
+    # sections[0] = allocation rows (with header), sections[1] = member rows (with header)
+    html = f"<h3>Allocations for {account}</h3>"
 
-    columns = [
-        "Description",
-        "StartTime",
-        "EndTime",
-        "Allocated",
-        "Remaining",
-        "PercentUsed",
-        "Active",
-    ]
+    if len(sections) >= 1:
+        rows = sections[0]
+        if len(rows) >= 2:  # first row is header
+            headers = rows[0].split()
+            html += "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+            for row in rows[1:]:
+                # Use separator line from raw to detect column boundaries
+                sep_line = next((l for l in raw.splitlines() if l.strip().startswith("---")), None)
+                if sep_line:
+                    cols = []
+                    start = 0
+                    for part in sep_line.split(" "):
+                        if part:
+                            cols.append((start, start + len(part)))
+                        start += len(part) + 1
+                    cells = [(row[s:e] if e <= len(row) else row[s:]).strip() for s, e in cols]
+                else:
+                    cells = row.split()
+                html += "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+            html += "</table><br>"
 
-    # Create HTML table
-    table_html = "<table><tr>"
-    for col in columns:
-        table_html += f"<th>{col}</th>"
-    table_html += "</tr>"
+    if len(sections) >= 2:
+        rows = sections[1]
+        if len(rows) >= 2:
+            headers = rows[0].split()
+            html += "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+            for row in rows[1:]:
+                if row.strip().startswith("PI:"):
+                    continue
+                # CommonName may be two words; EmailAddress and DefaultAccount follow
+                parts = row.split()
+                # Detect two-word common name: parts[2] is not an email
+                if len(parts) >= 6 and "@" not in parts[2]:
+                    cells = [parts[0], parts[1], f"{parts[2]} {parts[3]}", parts[4], parts[5]]
+                elif len(parts) >= 5:
+                    cells = parts[:5]
+                else:
+                    cells = parts
+                html += "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+            html += "</table>"
 
-    # Parse each data row by splitting on whitespace
-    for row in allocation_lines:
-        parts = row.split()
-        if len(parts) < 7:
-            continue  # Skip rows that don't have all columns
+    return html
 
-        table_html += "<tr>"
-        # Description
-        table_html += f"<td>{parts[0]}</td>"
-        # StartTime (date and time)
-        table_html += f"<td>{parts[1]} {parts[2]}</td>"
-        # EndTime
-        table_html += f"<td>{parts[3]}</td>"
-        # Allocated
-        table_html += f"<td>{parts[4]}</td>"
-        # Remaining
-        table_html += f"<td>{parts[5]}</td>"
-        # PercentUsed
-        table_html += f"<td>{parts[6]}</td>"
-        # Active
-        table_html += f"<td>{parts[7]}</td>"
-        table_html += "</tr>"
 
-    table_html += "</table>"
-
-    return table_html
+def parse_allocations_to_table():
+    """Dynamically discover accounts and render allocation tables for each."""
+    accounts = get_my_accounts()
+    if not accounts:
+        return "<p>No allocations found.</p>"
+    return "".join(parse_allocation_for_account(acc) for acc in accounts)
 
 
 def main():
@@ -748,6 +798,12 @@ def main():
             yield out
 
         return Response(generate(), mimetype="text")
+
+    @app.route("/slurm_template/<gpu_type>")
+    def slurm_template(gpu_type):
+        import json
+        data = get_slurm_template_json(gpu_type)
+        return Response(json.dumps(data), mimetype="application/json")
 
     # @app.route('/cpu_resource')
     # def cpu_resource():
