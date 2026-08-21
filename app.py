@@ -296,19 +296,26 @@ def build_slurm_template(gpu_type: str, alloc_data: dict) -> str:
     rep = nodes[0]
     partition = rep.get("partition", "gpu")
     features = rep.get("features", gpu_type)
+    active_features = rep.get("active_features", features)
     cpu_total = rep.get("cpu_total", 0)
     mem_total_mb = rep.get("mem_total_mb", 0)
     gpu_total = rep.get("total", 1)
 
-    # The constraint tag is exactly gpu_type (which may already be the specific
-    # variant like "a100_80gb"). The gres name must be the base hardware name
-    # that SLURM knows (e.g. "a100", not "a100_80gb"); strip any _<suffix> that
-    # corresponds to a memory/variant tag so the gres line stays valid.
-    constraint_tag = gpu_type
-    # Derive the base gres name: if features contains the bare GPU name without
-    # the variant suffix, use that; otherwise strip the last _<word> segment.
+    # ActiveFeatures is what SLURM enforces for --constraint; pick the most
+    # specific tag (longest) that matches the gpu_type by normalised comparison
+    # (ignoring underscores), so e.g. "rtxpro6000" is chosen for gpu_type
+    # "rtx_pro_6000", and "a100_80gb" is chosen over "a100" for 80 GB nodes.
+    active_feature_list = [f.strip() for f in active_features.split(",") if f.strip()]
+    gpu_type_norm = gpu_type.replace("_", "")
+    matching_features = [f for f in active_feature_list
+                         if f.replace("_", "") == gpu_type_norm
+                         or gpu_type_norm.startswith(f.replace("_", ""))]
+    constraint_tag = max(matching_features, key=len) if matching_features else gpu_type
+
+    # Derive the base gres name from AvailableFeatures: if it contains the bare
+    # GPU name without a variant suffix, use that; otherwise use gpu_type.
+    # e.g. features="a100,a100_80gb,gpupod" -> gres_name="a100"
     feature_list = [f.strip() for f in features.split(",") if f.strip()]
-    # e.g. features="a100,a100_80gb,gpupod" -> bare_name="a100"
     bare_candidates = [f for f in feature_list
                        if gpu_type.startswith(f + "_") or f == gpu_type.split("_")[0]]
     gres_name = bare_candidates[0] if bare_candidates else gpu_type

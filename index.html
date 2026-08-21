@@ -142,37 +142,37 @@
         try {
             // Update time
             updateStatus.textContent = "Updating time...";
-            await fetch("{{ url_for('time_feed') }}")
+            await fetch("time_feed")
                 .then(response => response.text())
                 .then(t => {clock.innerHTML = t;});
 
             // Update resource information
             updateStatus.textContent = "Updating resource info...";
-            await fetch("{{ url_for('resource') }}")
+            await fetch("resource")
                 .then(response => response.text())
                 .then(t => {resource.innerHTML = t;});
 
             // Update queue information
             updateStatus.textContent = "Updating queue info...";
-            await fetch("{{ url_for('queue') }}")
+            await fetch("queue")
                 .then(response => response.text())
                 .then(t => {queue.innerHTML = t;});
 
             // Update leaderboard information
             updateStatus.textContent = "Updating leaderboard...";
-            await fetch("{{ url_for('leaderboard') }}")
+            await fetch("leaderboard")
                 .then(response => response.text())
                 .then(t => {leaderboard.innerHTML = t;});
 
             // Update allocation information
             updateStatus.textContent = "Updating allocations...";
-            await fetch("{{ url_for('allocations') }}")
+            await fetch("allocations")
                 .then(response => response.text())
                 .then(t => {allocations.innerHTML = t;});
 
             // Update disk quota information
             updateStatus.textContent = "Updating disk quota...";
-            await fetch("{{ url_for('disk_quota') }}")
+            await fetch("disk_quota")
                 .then(response => response.text())
                 .then(t => {disk_quota.innerHTML = t;});
 
@@ -206,7 +206,7 @@
         btn.textContent   = "Copy to clipboard";
         modal.style.display = "flex";
 
-        fetch("/slurm_template/" + encodeURIComponent(gpuType))
+        fetch("slurm_template/" + encodeURIComponent(gpuType))
             .then(r => r.json())
             .then(data => {
                 desc.textContent = data.avail + " / " + data.total +

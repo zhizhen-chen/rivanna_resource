@@ -623,6 +623,7 @@ def gpu_alloc_by_node() -> dict:
             "total": gpu_total,
             "partition": fields.get("Partitions", "gpu"),
             "features": fields.get("AvailableFeatures", ""),
+            "active_features": fields.get("ActiveFeatures", ""),
             "cpu_total": cpu_total,
             "mem_total_mb": mem_total_mb,
         }]
