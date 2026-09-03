@@ -21,7 +21,7 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import numpy as np
 import colored
@@ -34,6 +34,12 @@ from django.utils.functional import lazy
 
 # SLURM states which indicate that the node is not available for submitting jobs
 INACCESSIBLE = {"drain*", "down*", "drng", "drain", "down"}
+
+# The subset of INACCESSIBLE that is merely draining: no new job is accepted, but
+# the jobs already on the node keep running to completion, so the node is still
+# very much alive and its GPUs are still occupied.  Callers that report occupancy
+# should keep these nodes visible (with zero availability) rather than drop them.
+DRAINING = {"drng", "draining"}
 INTERACTIVE_CMDS = {"bash", "zsh", "sh"}
 
 
@@ -353,6 +359,24 @@ def parse_cmd(cmd, split=True):
     return output
 
 
+def parse_squeue(args, split=True):
+    """Run `squeue` over every partition and parse its output.
+
+    By default slurmctld omits from the job list any job whose partition is
+    hidden or not open to the querying user's group, so `-a` is required here:
+    those jobs still occupy nodes, and without them a GPU shows up as allocated
+    in `scontrol` while nobody appears to be using it.  Every job query in this
+    tool goes through this function so that the flag cannot be forgotten.
+
+    Args:
+        args (str): the arguments to pass to `squeue` (without the command name).
+        split (bool): whether to split the output per line
+    Returns:
+        (list[str] | str): the job rows, one per line of output.
+    """
+    return parse_cmd(f"squeue -a {args}", split=split)
+
+
 @beartype
 def node_states(partition: Optional[str] = None) -> dict:
     """Query SLURM for the state of each managed node.
@@ -472,6 +496,37 @@ def lru_cache_time(seconds, maxsize=None):
 
 
 @lru_cache_time(seconds=10)
+def node_tres_table() -> dict:
+    """Parse the configured and allocated TRES of every node in a single call.
+
+    `scontrol show node -o` puts each node on one line, so one query replaces the
+    per-node queries this module used to make.  At ~25ms per query and dozens of
+    GPU nodes, that was the second largest cost of rendering a page.
+
+    Returns:
+        node name -> {"CfgTRES": {...}, "AllocTRES": {...}}, each mapping a TRES
+        name (cpu, mem, gres/gpu, ...) to its raw SLURM value.
+    """
+    table = {}
+    for row in parse_cmd("scontrol show node -o"):
+        fields = {}
+        for token in row.split():
+            if "=" in token:
+                key, _, val = token.partition("=")
+                fields.setdefault(key, val)
+        node = fields.get("NodeName")
+        if not node:
+            continue
+        # SLURM sometimes omits these entirely, in which case we report nothing
+        # for that node rather than guessing.
+        table[node] = {
+            key: {t.split("=", 1)[0]: t.split("=", 1)[1]
+                  for t in fields.get(key, "").split(",") if "=" in t}
+            for key in ("CfgTRES", "AllocTRES")
+        }
+    return table
+
+
 def avail_stats_for_node(node: str) -> dict:
     """Query SLURM for the availability of a given node.
 
@@ -481,23 +536,7 @@ def avail_stats_for_node(node: str) -> dict:
     Returns:
         a mapping between node names and availability stats.
     """
-    cmd = f"scontrol show node {node}"
-    rows = [x.strip() for x in parse_cmd(cmd)]
-    keys = ("AllocTRES", "CfgTRES")
-    metrics = {}
-    for row in rows:
-        for key in keys:
-            if row.startswith(key):
-                row = row.replace(f"{key}=", "")
-                tokens = row.split(",")
-                if tokens == [""]:
-                    # SLURM sometimes omits information, so we alert the user to its
-                    # its exclusion and report nothing for this node
-                    # print(f"Missing information for {node}: {key}, skipping....")
-                    metrics[key] = {}
-                else:
-                    metrics[key] = {token.split("=", 1)[0]: token.split("=", 1)[1] 
-                                   for token in tokens if "=" in token}
+    metrics = node_tres_table().get(node, {"CfgTRES": {}, "AllocTRES": {}})
     occupancy = {}
     for metric, cfg_val in metrics["CfgTRES"].items():
         try:
@@ -628,6 +667,21 @@ def gpu_alloc_by_node() -> dict:
             "mem_total_mb": mem_total_mb,
         }]
 
+    # Node definitions sometimes spell the same GPU type differently (e.g. one
+    # node reports "gpu:rtx3090" while its neighbours report "gpu:rtx_3090"),
+    # which would split a single hardware type across two rows in the UI.  Group
+    # the spellings that agree once underscores are ignored, and adopt the one
+    # used by the most nodes (ties broken alphabetically, for a stable result).
+    spellings = defaultdict(Counter)
+    for specs in result.values():
+        for spec in specs:
+            spellings[spec["type"].replace("_", "").lower()][spec["type"]] += 1
+    canonical = {key: max(sorted(counts), key=lambda name: counts[name])
+                 for key, counts in spellings.items()}
+    for specs in result.values():
+        for spec in specs:
+            spec["type"] = canonical[spec["type"].replace("_", "").lower()]
+
     return result
 
 
@@ -737,9 +791,9 @@ def gpu_usage(resources: dict, partition: Optional[str] = None) -> dict:
     """Build a data structure of the cluster resource usage, organised by user.
 
     GPU counts come from scontrol AllocTRES (authoritative) via gpu_alloc_by_node().
-    This function uses squeue only to attach user identity and interactive-bash
-    flags to each (node, gpu_type) pair, so no partition list needs to be
-    maintained here.
+    This function uses squeue (across all partitions, see parse_squeue) only to
+    attach user identity and interactive-bash flags to each (node, gpu_type)
+    pair, so no partition list needs to be maintained here.
 
     Args:
         resources: a summary of cluster resources, organised by node name.
@@ -760,26 +814,35 @@ def gpu_usage(resources: dict, partition: Optional[str] = None) -> dict:
     else:
         gpu_identifier = 'gpu'
 
-    cmd = f"squeue -O {resource_flag}:100,nodelist:100,username:100,jobid:100 --noheader"
+    # The submitted command comes straight from squeue: asking `scontrol show
+    # jobid` about every job instead meant hundreds of subprocess calls per page.
+    # Fixed-width columns (rather than splitting on whitespace) keep the command
+    # intact when its path contains spaces.
+    columns = [(resource_flag, 100), ("nodelist", 300), ("username", 100),
+               ("command", 300)]
+    fmt = ",".join(f"{name}:{width}" for name, width in columns)
+    args = f"-O {fmt} --noheader"
     if partition:
-        cmd += f" --partition={partition}"
-    detailed_job_cmd = "scontrol show jobid -dd %s"
-    rows = parse_cmd(cmd)
+        args += f" --partition={partition}"
+    rows = parse_squeue(args)
 
     # node -> list of (user, num_gpus, is_bash) from squeue
     node_user_map = defaultdict(list)
     for row in rows:
-        tokens = row.split()
+        values, offset = [], 0
+        for _, width in columns:
+            values.append(row[offset:offset + width].strip())
+            offset += width
+        gpu_count_str, node_str, user, command = values
         # ignore pending jobs (no nodelist) or non-GPU jobs
-        if len(tokens) < 4 or not tokens[0].startswith(gpu_identifier):
+        if not node_str or not gpu_count_str.startswith(gpu_identifier):
             continue
-        gpu_count_str, node_str, user, jobid = tokens
         gpu_count_tokens = gpu_count_str.split(":")
         if not gpu_count_tokens[-1].isdigit():
             gpu_count_tokens.append("1")
         num_gpus = int(gpu_count_tokens[-1])
-        detailed_output = parse_cmd(detailed_job_cmd % jobid, split=False)
-        is_bash = any(f'Command={x}\n' in detailed_output for x in INTERACTIVE_CMDS)
+        # Match on the basename so that "/bin/bash" counts as interactive too.
+        is_bash = os.path.basename(command) in INTERACTIVE_CMDS
         for node_name in parse_node_names(node_str):
             node_user_map[node_name].append((user, num_gpus, is_bash))
 

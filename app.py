@@ -13,7 +13,9 @@ from slurm_gpustat import (
     gpu_alloc_by_node,
     node_states,
     INACCESSIBLE,
+    DRAINING,
     parse_cmd,
+    parse_squeue,
     avail_stats_for_node,
     parse_node_names,
     get_gpu_partitions,
@@ -139,10 +141,10 @@ def cpu_usage(resources, partition="compute"):
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
     """
-    cmd = "squeue -O NumNodes:100,nodelist:100,username:100,jobid:100 --noheader"
+    args = "-O NumNodes:100,nodelist:100,username:100,jobid:100 --noheader"
     if partition:
-        cmd += f" --partition={partition}"
-    rows = parse_cmd(cmd)
+        args += f" --partition={partition}"
+    rows = parse_squeue(args)
     usage = defaultdict(dict)
     for row in rows:
         tokens = row.split()
@@ -365,11 +367,16 @@ def parse_usage_to_table(show_bar=True):
     alloc_data = gpu_alloc_by_node()
     states = node_states()
 
-    # Filter out inaccessible nodes
+    # Filter out inaccessible nodes.  Draining nodes are kept: they still run the
+    # jobs already on them, so dropping them makes running work vanish from the
+    # page.  They are shown greyed out with zero availability instead.
+    draining = {
+        node for node in alloc_data if states.get(node, "down") in DRAINING
+    }
     alloc_data = {
         node: specs
         for node, specs in alloc_data.items()
-        if states.get(node, "down") not in INACCESSIBLE
+        if node in draining or states.get(node, "down") not in INACCESSIBLE
     }
 
     # Build res_total (total GPUs) and res (available GPUs) in the same shape
@@ -379,7 +386,9 @@ def parse_usage_to_table(show_bar=True):
         for node, specs in alloc_data.items()
     }
     res = {
-        node: [{"type": s["type"], "count": max(s["total"] - s["alloc"], 0)} for s in specs]
+        node: [{"type": s["type"],
+                "count": 0 if node in draining else max(s["total"] - s["alloc"], 0)}
+               for s in specs]
         for node, specs in alloc_data.items()
     }
 
@@ -389,86 +398,79 @@ def parse_usage_to_table(show_bar=True):
     res_total_by_type = resource_by_type(res_total)
     res_usage_by_type = resource_by_type(res)
 
-    table_html = []
+    type_blocks = []
     total_gpu_count = 0
     avail_gpu_count = 0
 
-    type_list = sorted(res_total_by_type.keys())
-
-    # writing the html table
-    num_col = None
-    for gpu_type in type_list:
+    for gpu_type in sorted(res_total_by_type.keys()):
         node_dicts = res_total_by_type[gpu_type]
-        node_names = sorted([i["node"] for i in node_dicts])
+        node_names = sorted(i["node"] for i in node_dicts)
         gpu_count_total = {i["node"]: i["count"] for i in node_dicts}
         gpu_count_avail = {i["node"]: i["count"] for i in res_usage_by_type[gpu_type]}
 
-        node_summaries = []
-        num_col = []
-
+        node_rows = []
         for node in node_names:
-            node_name = f"<td>{node}</td>"
+            if node in draining:
+                node_cell = (
+                    f'{node}<span class="draining-tag" title="draining: the jobs '
+                    f'already running continue, but no new job is accepted">'
+                    f'draining</span>'
+                )
+            else:
+                node_cell = node
+
+            detail = avail_stats_for_node(node)
             if show_bar:
                 gpu_bar = get_resource_bar(
                     gpu_count_avail[node],
                     gpu_count_total[node],
                     text=f"{gpu_count_avail[node]} / {gpu_count_total[node]}",
                 )
+                cpu_bar = get_resource_bar(
+                    *[int(i.strip()) for i in detail["cpu"].split("/")],
+                    text=detail["cpu"],
+                )
+                mem_bar = get_resource_bar(
+                    *[str_to_int(i.strip()) for i in detail["mem"].split("/")],
+                    text=detail["mem"],
+                    long=True,
+                )
             else:
                 gpu_bar = f"{gpu_count_avail[node]}/{gpu_count_total[node]}"
-            gpu_stat = f"<td>gpu: {gpu_bar}</td>"
+                cpu_bar, mem_bar = detail["cpu"], detail["mem"]
 
             users = [user for user in usage if node in usage[user].get(gpu_type, [])]
-            if len(users):
-                users = f"<td>user: {','.join(users)}</td>"
-            else:
-                users = f"<td>&nbsp</td>"
+            user_cell = ",".join(users)
 
-            detail_dict = avail_stats_for_node(node)
-            detail_dict = {k: v for k, v in detail_dict.items() if k in ["cpu", "mem"]}
+            row_class = ' class="draining"' if node in draining else ""
+            node_rows.append(
+                f"<tr{row_class}>"
+                f'<td class="c-node">{node_cell}</td>'
+                f'<td><span class="c-label">gpu</span> {gpu_bar}</td>'
+                f'<td><span class="c-label">cpu</span> {cpu_bar}</td>'
+                f'<td><span class="c-label">mem</span> {mem_bar}</td>'
+                f'<td class="c-users" title="{user_cell}">{user_cell or "&nbsp;"}</td>'
+                "</tr>"
+            )
 
-            if show_bar:
-                c_stat = detail_dict["cpu"].split("/")
-                c_stat = [int(i.strip()) for i in c_stat]
-                cpu_bar = get_resource_bar(*c_stat, text=detail_dict["cpu"])
-
-                m_stat = detail_dict["mem"].split("/")
-                m_stat = [str_to_int(i.strip()) for i in m_stat]
-                mem_bar = get_resource_bar(*m_stat, text=detail_dict["mem"], long=True)
-            else:
-                cpu_bar = detail_dict["cpu"]
-                mem_bar = detail_dict["mem"]
-            cpu_stat = f"<td>cpu: {cpu_bar}</td>"
-            mem_stat = f"<td>mem: {mem_bar}</td>"
-
-            node_summary = f"<tr><td>&nbsp</td>{node_name}{gpu_stat}{cpu_stat}{mem_stat}{users}</tr>"
-            node_summaries.append(node_summary)
-            num_col.append(6)
-
+        type_avail, type_total = sum(gpu_count_avail.values()), sum(gpu_count_total.values())
         if show_bar:
             type_bar = get_resource_bar(
-                sum(gpu_count_avail.values()),
-                sum(gpu_count_total.values()),
-                text=f"{sum(gpu_count_avail.values())} / {sum(gpu_count_total.values())}",
+                type_avail, type_total, text=f"{type_avail} / {type_total}"
             )
         else:
-            type_bar = (
-                f"{sum(gpu_count_avail.values())}/{sum(gpu_count_total.values())}"
-            )
+            type_bar = f"{type_avail}/{type_total}"
         gpu_label = (
             f'<a href="#" onclick="showSlurmTemplate(\'{gpu_type}\'); return false;"'
-            f' title="Click to generate SBATCH template"'
-            f' style="text-decoration:underline dotted; cursor:pointer;">'
-            f'{gpu_type}</a>'
+            f' title="Click to generate SBATCH template">{gpu_type}</a>'
         )
-        type_summary = (
-            f'<tr><td colspan="{max(num_col)}"><b>'
-            f'{gpu_label}: {type_bar} gpus available</b></td></tr>'
+        type_blocks.append(
+            f'<div class="gpu-type"><div class="gpu-type-head">{gpu_label}{type_bar}'
+            f'<span class="c-label">gpus available</span></div>'
+            f'<table><tbody>{"".join(node_rows)}</tbody></table></div>'
         )
-        table_html.append(type_summary)
-        table_html.extend(node_summaries)
-        total_gpu_count += sum(gpu_count_total.values())
-        avail_gpu_count += sum(gpu_count_avail.values())
+        total_gpu_count += type_total
+        avail_gpu_count += type_avail
 
     if show_bar:
         total_bar = get_resource_bar(
@@ -478,39 +480,11 @@ def parse_usage_to_table(show_bar=True):
         )
     else:
         total_bar = f"{avail_gpu_count}/{total_gpu_count}"
-    if num_col is None:
-        num_col = [6]  # avoid edge case: no GPUs available
     total_summary = (
-        f'<tr><td colspan="{max(num_col)}"><h3>'
-        f"Summary: {total_bar} gpus available</h3></td></tr>"
+        f'<div class="gpu-total">Summary{total_bar}'
+        f'<span class="c-label">gpus available</span></div>'
     )
-    table_html = f"<table>{total_summary}{''.join(table_html)}</table>"
-    return table_html
-
-
-def parse_queue_to_table():
-    """Request pending queue for uva_cv_lab, uva_cv_lab2, and dac_cheng accounts, returning combined output with raw formatting."""
-
-    # Command templates to fetch pending jobs for uva_cv_lab and uva_cv_lab2 accounts
-    cmd_uva_cv_lab = (
-        "squeue -t PENDING -A uva_cv_lab -o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
-    )
-    cmd_uva_cv_lab2 = (
-        "squeue -t PENDING -A uva_cv_lab2 -o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
-    )
-    cmd_dac_cheng = (
-        "squeue -t PENDING -A dac_cheng -o '%.18i %.9P %.8u %.8T %.10M %.9l %.6D %R'"
-    )
-
-    # Fetch and combine outputs
-    out_uva_cv_lab = parse_cmd(cmd_uva_cv_lab)
-    out_uva_cv_lab2 = parse_cmd(cmd_uva_cv_lab2)
-    out_dac_cheng = parse_cmd(cmd_dac_cheng)
-
-    # Combine all queues and format output as a single string
-    combined_output = "\n".join(out_uva_cv_lab + out_uva_cv_lab2 + out_dac_cheng)
-
-    return combined_output
+    return total_summary + "".join(type_blocks)
 
 
 def parse_disk_io():
@@ -763,14 +737,6 @@ def main():
     def resource():
         def generate():
             out = parse_usage_to_table()
-            yield out
-
-        return Response(generate(), mimetype="text")
-
-    @app.route("/queue")
-    def queue():
-        def generate():
-            out = parse_queue_to_table()
             yield out
 
         return Response(generate(), mimetype="text")
