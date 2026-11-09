@@ -279,17 +279,17 @@
         padding-right: 2px;
     }
 
-    /* Draining nodes: still running jobs, but not accepting new ones.  Kept in
-       the table (greyed out, zero availability) so that running work does not
-       silently disappear from the page. */
-    tr.draining td {
+    /* Nodes the user cannot submit to (draining, reserved, under maintenance,
+       down) but which are still worth seeing, e.g. because jobs still run on
+       them.  Greyed out with zero availability; the tag says why. */
+    tr.unavailable td {
         background: var(--surface-2);
         color: var(--fg-muted);
     }
 
-    tr.draining:hover td { background: var(--warn-bg); }
+    tr.unavailable:hover td { background: var(--warn-bg); }
 
-    .draining-tag {
+    .state-tag {
         margin-left: 6px;
         padding: 0 5px;
         font-size: 10.5px;
@@ -302,6 +302,13 @@
         border-radius: 3px;
         vertical-align: middle;
         cursor: help;
+    }
+
+    /* A reservation the user may use: available, but only with --reservation. */
+    .state-tag.state-own_resv {
+        color: var(--accent);
+        background: transparent;
+        border-color: var(--accent);
     }
 
     /* --------------------------------------------------------- progress bars */

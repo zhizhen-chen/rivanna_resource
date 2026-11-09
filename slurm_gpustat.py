@@ -9,6 +9,8 @@ The tool can be used in two ways:
 """
 
 import os
+import grp
+import getpass
 import re
 import ast
 import sys
@@ -32,14 +34,30 @@ from beartype import beartype
 from django.utils.functional import lazy
 
 
-# SLURM states which indicate that the node is not available for submitting jobs
-INACCESSIBLE = {"drain*", "down*", "drng", "drain", "down"}
+# Whether a node can take a job is decided from the `State=` field of `scontrol
+# show node` (a base state plus "+"-joined flags, e.g. "IDLE+MAINTENANCE+RESERVED")
+# together with the active reservations, see node_availability().  The compact
+# states printed by `sinfo` ("maint", "down$", "drain$", "inval", ...) are not
+# used: SLURM decorates them with suffix characters in many combinations, and
+# matching them exactly once let nodes under maintenance through as idle.
 
-# The subset of INACCESSIBLE that is merely draining: no new job is accepted, but
-# the jobs already on the node keep running to completion, so the node is still
-# very much alive and its GPUs are still occupied.  Callers that report occupancy
-# should keep these nodes visible (with zero availability) rather than drop them.
-DRAINING = {"drng", "draining"}
+# State flags under which a node runs nothing at all.
+DEAD_FLAGS = {"DOWN", "ERROR", "FAIL", "FUTURE", "INVALID", "INVALID_REG",
+              "NOT_RESPONDING", "REBOOT_ISSUED", "UNKNOWN"}
+# State flags of a node that still has jobs on it.
+BUSY_FLAGS = {"ALLOCATED", "MIXED", "COMPLETING"}
+
+# Node statuses returned by node_availability():
+UP = "up"              # accepts jobs from anyone
+OWN_RESV = "own_resv"  # held by a reservation the current user may use
+                       # (jobs must be submitted with --reservation=<name>)
+DRAINING = "draining"  # still running its jobs, but accepts no new one
+RESERVED = "reserved"  # held by a reservation the current user may not use
+MAINT = "maint"        # held by a maintenance reservation
+DOWN = "down"          # down, failed, not responding, or drained
+# The statuses under which the current user can start a job on the node.
+ACCEPTS_JOBS = {UP, OWN_RESV}
+
 INTERACTIVE_CMDS = {"bash", "zsh", "sh"}
 
 
@@ -377,28 +395,168 @@ def parse_squeue(args, split=True):
     return parse_cmd(f"squeue -a {args}", split=split)
 
 
-@beartype
-def node_states(partition: Optional[str] = None) -> dict:
-    """Query SLURM for the state of each managed node.
+def lru_cache_time(seconds, maxsize=None):
+    """
+    Adds time aware caching to lru_cache.
 
-    Args:
-        partition: the partition/queue (or multiple, comma separated) of interest.
-            By default None, which queries all available partitions.
+    https://stackoverflow.com/questions/31771286/python-in-memory-cache-with-time-to-live
+    """
+    def wrapper(func):
+        # Lazy function that makes sure the lru_cache() invalidate after X secs
+        ttl_hash = lazy(lambda: round(time.time() / seconds), int)()
+        
+        @functools.lru_cache(maxsize)
+        def time_aware(__ttl, *args, **kwargs):
+            """
+            Main wrapper, note that the first argument ttl is not passed down. 
+            This is because no function should bother to know this that 
+            this is here.
+            """
+            def wrapping(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapping(*args, **kwargs)
+        return functools.update_wrapper(functools.partial(time_aware, ttl_hash), func)
+    return wrapper
+
+
+def _oneline_fields(row: str) -> dict:
+    """Split one line of `scontrol show <entity> -o` into its key=value fields.
+
+    The free-text `Reason=` field may contain spaces, so it is extracted whole
+    rather than token by token.
+    """
+    fields = {}
+    for token in row.split():
+        if "=" in token:
+            key, _, val = token.partition("=")
+            fields.setdefault(key, val)
+    reason = re.search(r"\bReason=(.*?)(?=\s+\w+=|$)", row)
+    if reason:
+        fields["Reason"] = reason.group(1)
+    return fields
+
+
+def my_identity() -> tuple:
+    """Return the current user's name, SLURM accounts and Unix groups.
+
+    These decide which reservations the user may submit to.  They practically
+    never change while the app is running, so they are looked up once.
+    """
+    global _IDENTITY
+    if _IDENTITY is None:
+        user = getpass.getuser()
+        try:
+            rows = parse_cmd(f"sacctmgr -nP show assoc user={user} format=account")
+        except Exception:
+            rows = []
+        accounts = frozenset(r.strip().lower() for r in rows if r.strip())
+        groups = set()
+        for gid in os.getgroups():
+            try:
+                groups.add(grp.getgrgid(gid).gr_name)
+            except KeyError:
+                pass
+        _IDENTITY = (user, accounts, frozenset(groups))
+    return _IDENTITY
+
+
+_IDENTITY = None
+
+
+def _matches_acl(spec: str, mine) -> Optional[bool]:
+    """Check a reservation's Users/Accounts/Groups list against our own names.
+
+    Returns None when the list is empty, i.e. places no restriction.  A list whose
+    entries start with "-" names who is excluded rather than who is admitted.
+    """
+    if not spec or spec == "(null)":
+        return None
+    entries = [e for e in spec.split(",") if e]
+    if entries[0].startswith("-"):
+        return not any(e.lstrip("-") in mine for e in entries)
+    return any(e in mine for e in entries)
+
+
+@lru_cache_time(seconds=10)
+def active_reservations() -> dict:
+    """Map each node to the active reservations that hold it.
 
     Returns:
-        a mapping between node names and SLURM states.
+        node name -> list of {"name", "maint", "usable"} dicts, where "usable" says
+        whether the current user may submit to that reservation.
     """
-    cmd = "sinfo --noheader"
-    if partition:
-        cmd += f" --partition={partition}"
-    rows = parse_cmd(cmd)
-    states = {}
+    user, accounts, groups = my_identity()
+    try:
+        rows = parse_cmd("scontrol show reservation -o")
+    except Exception:
+        return {}
+    by_node = defaultdict(list)
     for row in rows:
-        tokens = row.split()
-        state, names = tokens[4], tokens[5]
-        node_names = parse_node_names(names)
-        states.update({name: state for name in node_names})
-    return states
+        fields = _oneline_fields(row)
+        if "ReservationName" not in fields or fields.get("State") != "ACTIVE":
+            continue
+        # SLURM admits a job to a reservation only if it matches every list given
+        # (and Groups cannot be combined with the other two).
+        checks = [
+            _matches_acl(fields.get("Users", ""), {user}),
+            _matches_acl(fields.get("Accounts", "").lower(), accounts),
+            _matches_acl(fields.get("Groups", ""), groups),
+        ]
+        checks = [c for c in checks if c is not None]
+        resv = {
+            "name": fields["ReservationName"],
+            "maint": "MAINT" in fields.get("Flags", "").split(","),
+            "usable": bool(checks) and all(checks),
+        }
+        nodes = fields.get("Nodes", "")
+        if nodes and nodes != "(null)":
+            for node in parse_node_names(nodes):
+                by_node[node].append(resv)
+    return dict(by_node)
+
+
+@lru_cache_time(seconds=10)
+def node_availability() -> dict:
+    """Classify every node by whether the current user can start a job on it.
+
+    Returns:
+        node name -> {"status": one of UP, OWN_RESV, DRAINING, RESERVED, MAINT,
+        DOWN; "detail": a human readable explanation of that status}.
+    """
+    reservations = active_reservations()
+    result = {}
+    for row in parse_cmd("scontrol show node -o"):
+        fields = _oneline_fields(row)
+        node = fields.get("NodeName")
+        if not node:
+            continue
+        state = fields.get("State", "UNKNOWN")
+        flags = set(state.upper().split("+"))
+        reason = fields.get("Reason", "")
+        why = f"{state}" + (f": {reason}" if reason and reason != "(null)" else "")
+        busy = bool(flags & BUSY_FLAGS)
+        resvs = reservations.get(node, [])
+        usable = [r for r in resvs if r["usable"]]
+
+        if flags & DEAD_FLAGS or ("DRAIN" in flags and not busy):
+            status, detail = DOWN, why
+        elif "DRAIN" in flags:
+            status = DRAINING
+            detail = "draining: the jobs already running continue, but no new job is accepted"
+        elif usable:
+            status = OWN_RESV
+            detail = (f"held by reservation {usable[0]['name']}, which you may use: "
+                      f"submit with --reservation={usable[0]['name']}")
+        elif any(r["maint"] for r in resvs) or "MAINTENANCE" in flags:
+            names = ", ".join(r["name"] for r in resvs) or "unknown"
+            status, detail = MAINT, f"under maintenance (reservation {names})"
+        elif resvs or "RESERVED" in flags:
+            names = ", ".join(r["name"] for r in resvs) or "unknown"
+            status, detail = RESERVED, f"held by reservation {names}, which you may not use"
+        else:
+            status, detail = UP, state
+        result[node] = {"status": status, "detail": detail}
+    return result
 
 
 @beartype
@@ -470,29 +628,6 @@ def format_size(size_in_bytes):
     size_in_tb = size_in_gb / 1024
     formatted_tb = f"{size_in_tb:.1f}".rstrip('0').rstrip('.')
     return f"{formatted_tb} T"
-
-def lru_cache_time(seconds, maxsize=None):
-    """
-    Adds time aware caching to lru_cache.
-
-    https://stackoverflow.com/questions/31771286/python-in-memory-cache-with-time-to-live
-    """
-    def wrapper(func):
-        # Lazy function that makes sure the lru_cache() invalidate after X secs
-        ttl_hash = lazy(lambda: round(time.time() / seconds), int)()
-        
-        @functools.lru_cache(maxsize)
-        def time_aware(__ttl, *args, **kwargs):
-            """
-            Main wrapper, note that the first argument ttl is not passed down. 
-            This is because no function should bother to know this that 
-            this is here.
-            """
-            def wrapping(*args, **kwargs):
-                return func(*args, **kwargs)
-            return wrapping(*args, **kwargs)
-        return functools.update_wrapper(functools.partial(time_aware, ttl_hash), func)
-    return wrapper
 
 
 @lru_cache_time(seconds=10)
@@ -770,15 +905,15 @@ def summary(mode: str, resources: dict = None, states: dict = None):
     Args:
         mode (str): the kind of resources to query (must be one of 'accessible', 'up').
         resources (dict :: None): a summary of cluster resources, organised by node name.
-        states (dict[str: str] :: None): a mapping between node names and SLURM states.
+        states (dict :: None): the output of node_availability().
     """
     if not resources:
         resources = parse_all_gpus()
     if not states:
-        states = node_states()
+        states = node_availability()
     if mode == "accessible":
         res = {key: val for key, val in resources.items()
-               if states.get(key, "down") not in INACCESSIBLE}
+               if states.get(key, {}).get("status") in ACCEPTS_JOBS}
     elif mode == "up":
         res = resources
     else:
@@ -908,7 +1043,7 @@ def available(
 
     Args:
         resources: a summary of cluster resources, organised by node name.
-        states: a mapping between node names and SLURM states.
+        states: the output of node_availability().
         verbose: whether to output a more verbose summary of the cluster state.
 
     NOTES: Some systems allow users to share GPUs.  The logic below amounts to a
@@ -921,9 +1056,9 @@ def available(
     if not resources:
         resources = parse_all_gpus()
     if not states:
-        states = node_states()
+        states = node_availability()
     res = {key: val for key, val in resources.items()
-           if states.get(key, "down") not in INACCESSIBLE}
+           if states.get(key, {}).get("status") in ACCEPTS_JOBS}
     usage = gpu_usage(resources=res)
     for subdict in usage.values():
         for gpu_type, node_dicts in subdict.items():
@@ -964,7 +1099,7 @@ def all_info(color: int, verbose: bool, partition: Optional[str] = None):
     print(divider)
     # Remaining function logic...
     resources = parse_all_gpus(partition=partition)
-    states = node_states(partition=partition)
+    states = node_availability()
     for mode in ("up", "accessible"):
         summary(mode=mode, resources=resources, states=states)
         print(divider)

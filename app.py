@@ -1,4 +1,5 @@
 import os
+import html
 from datetime import datetime
 import argparse
 import copy
@@ -11,9 +12,10 @@ from slurm_gpustat import (
     parse_all_gpus,
     gpu_usage,
     gpu_alloc_by_node,
-    node_states,
-    INACCESSIBLE,
-    DRAINING,
+    node_availability,
+    ACCEPTS_JOBS,
+    UP,
+    DOWN,
     parse_cmd,
     parse_squeue,
     avail_stats_for_node,
@@ -21,6 +23,15 @@ from slurm_gpustat import (
     get_gpu_partitions,
 )
 # import gradio as gr  # Not used in this file
+
+# Tags shown next to a node that does not simply accept jobs from everyone.
+STATUS_LABELS = {
+    "own_resv": "your resv",
+    "draining": "draining",
+    "reserved": "reserved",
+    "maint": "maint",
+    "down": "down",
+}
 
 
 def get_resource_bar(avail, total, text="", long=False):
@@ -180,11 +191,11 @@ def parse_cpu_usage_to_table(partition="compute", show_bar=True):
     assert isinstance(node_str, list) and len(node_str) == 1
     node_names = parse_node_names(node_str[0].strip())
     resources = {k: {"type": k[0:6] + "xx", "count": 1} for k in node_names}
-    states = node_states(partition=partition)
+    states = node_availability()
     res = {
         key: val
         for key, val in resources.items()
-        if states.get(key, "down") not in INACCESSIBLE
+        if states.get(key, {}).get("status") in ACCEPTS_JOBS
     }
     res_total = copy.deepcopy(res)
     usage = cpu_usage(resources=res, partition=partition)
@@ -347,15 +358,45 @@ def build_slurm_template(gpu_type: str, alloc_data: dict) -> str:
     return "\n".join(lines)
 
 
+def gpu_nodes_with_status():
+    """Return the GPU nodes worth showing, with each one's status and free GPUs.
+
+    A node the current user cannot start a job on counts zero free GPUs and is
+    shown greyed out, tagged with the reason (draining, reserved, maint), so that
+    it is clear why its GPUs cannot be had.  Nodes that are down or drained are
+    dropped, unless jobs still run on them, which would otherwise vanish from the
+    page.
+
+    Returns:
+        (alloc_data, status, free): gpu_alloc_by_node() restricted to those nodes,
+        node -> node_availability() entry, and node -> number of free GPUs.
+    """
+    alloc_data = gpu_alloc_by_node()
+    availability = node_availability()
+    status = {
+        node: availability.get(node, {"status": DOWN, "detail": "unknown to scontrol"})
+        for node in alloc_data
+    }
+    alloc_data = {
+        node: specs
+        for node, specs in alloc_data.items()
+        if status[node]["status"] != DOWN or any(s["alloc"] for s in specs)
+    }
+    free = {
+        node: sum(max(s["total"] - s["alloc"], 0) for s in specs)
+        if status[node]["status"] in ACCEPTS_JOBS else 0
+        for node, specs in alloc_data.items()
+    }
+    return alloc_data, status, free
+
+
 def get_slurm_template_json(gpu_type: str) -> dict:
     """Return the SBATCH template and node-count info for a GPU type as a dict."""
-    alloc_data = gpu_alloc_by_node()
-    nodes = [s[0] for s in alloc_data.values() if s and s[0]["type"] == gpu_type]
+    alloc_data, _, free = gpu_nodes_with_status()
     template = build_slurm_template(gpu_type, alloc_data)
-    avail = sum(max(s[0]["total"] - s[0]["alloc"], 0) for s in alloc_data.values()
-                if s and s[0]["type"] == gpu_type)
-    total = sum(s[0]["total"] for s in alloc_data.values()
-                if s and s[0]["type"] == gpu_type)
+    nodes = [n for n, s in alloc_data.items() if s and s[0]["type"] == gpu_type]
+    avail = sum(free[n] for n in nodes)
+    total = sum(alloc_data[n][0]["total"] for n in nodes)
     return {"gpu_type": gpu_type, "avail": avail, "total": total, "template": template}
 
 
@@ -363,21 +404,9 @@ def parse_usage_to_table(show_bar=True):
     """Request sinfo/scontrol, parse the output to a html table."""
 
     # scontrol AllocTRES is the authoritative source for GPU allocation;
-    # it covers all partitions without a hardcoded list.
-    alloc_data = gpu_alloc_by_node()
-    states = node_states()
-
-    # Filter out inaccessible nodes.  Draining nodes are kept: they still run the
-    # jobs already on them, so dropping them makes running work vanish from the
-    # page.  They are shown greyed out with zero availability instead.
-    draining = {
-        node for node in alloc_data if states.get(node, "down") in DRAINING
-    }
-    alloc_data = {
-        node: specs
-        for node, specs in alloc_data.items()
-        if node in draining or states.get(node, "down") not in INACCESSIBLE
-    }
+    # it covers all partitions without a hardcoded list.  Nodes the user cannot
+    # submit to are dropped, or kept with zero free GPUs, see gpu_nodes_with_status.
+    alloc_data, status, _ = gpu_nodes_with_status()
 
     # Build res_total (total GPUs) and res (available GPUs) in the same shape
     # as the old parse_all_gpus() output so the rest of the function is unchanged.
@@ -387,7 +416,8 @@ def parse_usage_to_table(show_bar=True):
     }
     res = {
         node: [{"type": s["type"],
-                "count": 0 if node in draining else max(s["total"] - s["alloc"], 0)}
+                "count": max(s["total"] - s["alloc"], 0)
+                if status[node]["status"] in ACCEPTS_JOBS else 0}
                for s in specs]
         for node, specs in alloc_data.items()
     }
@@ -410,14 +440,15 @@ def parse_usage_to_table(show_bar=True):
 
         node_rows = []
         for node in node_names:
-            if node in draining:
-                node_cell = (
-                    f'{node}<span class="draining-tag" title="draining: the jobs '
-                    f'already running continue, but no new job is accepted">'
-                    f'draining</span>'
-                )
-            else:
+            node_status = status[node]["status"]
+            if node_status == UP:
                 node_cell = node
+            else:
+                node_cell = (
+                    f'{node}<span class="state-tag state-{node_status}" '
+                    f'title="{html.escape(status[node]["detail"])}">'
+                    f'{STATUS_LABELS[node_status]}</span>'
+                )
 
             detail = avail_stats_for_node(node)
             if show_bar:
@@ -442,7 +473,7 @@ def parse_usage_to_table(show_bar=True):
             users = [user for user in usage if node in usage[user].get(gpu_type, [])]
             user_cell = ",".join(users)
 
-            row_class = ' class="draining"' if node in draining else ""
+            row_class = '' if node_status in ACCEPTS_JOBS else ' class="unavailable"'
             node_rows.append(
                 f"<tr{row_class}>"
                 f'<td class="c-node">{node_cell}</td>'
