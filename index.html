@@ -533,7 +533,13 @@
         if (!response.ok) {
             throw new Error(panel.url + " -> HTTP " + response.status);
         }
-        document.getElementById(panel.target).innerHTML = await response.text();
+        var text = await response.text();
+        var el = document.getElementById(panel.target);
+        el.innerHTML = text;
+        // An empty reply means the cluster lacks what the panel needs (e.g. no
+        // hdquota for Disk Quota): hide the panel instead of showing it empty.
+        var card = el.closest(".card");
+        if (card) card.hidden = !text.trim();
     }
 
     async function updateAll() {

@@ -7,6 +7,7 @@ lists, ready to be printed as a table or dumped as JSON.
 
 import os
 import re
+import sys
 import shutil
 import getpass
 import tempfile
@@ -28,30 +29,45 @@ from slurm_gpustat import (
     parse_squeue,
 )
 
-# On-board memory per GPU in GB.  SLURM does not report it; types whose name
-# carries the size (a100_80gb, the MIG slice 1g.24gb) are read from the name.
-# Keys are written without underscores and vendor prefixes, see gpu_memory_gb().
-# Types sold in several sizes without the size in the name (a100, v100, h100
-# NVL) are given their most common size (rtx2080: Rivanna's are 2080 Ti, 11 GB);
-# unknown types show as "?".
-GPU_MEMORY_GB = {
-    "b200": 180, "b100": 192, "gh200": 96, "h200": 141, "h100": 80,
-    "a100": 40, "a6000": 48, "rtxa6000": 48, "a5000": 24, "rtxa5000": 24,
-    "a4000": 16, "rtxa4000": 16, "a40": 48, "a30": 24, "a10": 24,
-    "l40s": 48, "l40": 48, "l4": 24, "t4": 16, "v100": 32, "p100": 16,
-    "rtxpro6000": 96, "rtx6000ada": 48, "rtx6000": 24, "rtx8000": 48,
-    "rtx5090": 32, "rtx4090": 24, "rtx3090": 24, "rtx2080ti": 11, "rtx2080": 11,
-    "titanrtx": 24, "titanv": 12, "titanx": 12, "mi300x": 192, "mi250x": 128,
-    "mi250": 128, "mi210": 64, "mi100": 32,
-}
-# Site overrides (e.g. a cluster whose plain "a100" is the 80 GB model):
-# RRES_GPU_MEMORY="a100=80,rtx2080=11"
-for _item in os.environ.get("RRES_GPU_MEMORY", "").split(","):
-    if "=" in _item:
-        _name, _gb_value = _item.split("=", 1)
-        if _gb_value.strip().isdigit():
-            GPU_MEMORY_GB[_name.strip().replace("_", "").lower()] = int(_gb_value)
+# On-board memory per GPU in GB.  SLURM does not report it, so it is taken from,
+# in this order: the file gpu_memory.conf next to this module (written by the
+# user or an agent, see gpu_memory.conf.example), the type name if it carries
+# the size (a100_80gb, the MIG slice 1g.24gb), or a node feature that tags the
+# size (h100_94gb).  There is no built-in table: model names do not pin down
+# the memory (an "a100" may be 40 or 80 GB), so unknown types show as "?".
+GPU_MEMORY_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "gpu_memory.conf")
 _VENDOR_PREFIX = re.compile(r"^(nvidia|tesla|geforce|quadro|amd|instinct)")
+_gpu_memory_table = None
+
+
+def _memory_key(name: str) -> str:
+    return re.sub(r"[-_ .]", "", name.lower())
+
+
+def load_gpu_memory_table(path: str = GPU_MEMORY_FILE) -> dict:
+    """Read the user's GPU memory table: lines "gpu_type = GB", # comments.
+
+    Returns an empty dict if the file does not exist.  Malformed lines are
+    skipped with a warning on stderr.
+    """
+    table = {}
+    if not os.path.isfile(path):
+        return table
+    with open(path) as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            name, sep, value = line.partition("=")
+            try:
+                if not sep or not name.strip():
+                    raise ValueError
+                table[_memory_key(name.strip())] = int(float(value.strip().rstrip("GgBb")))
+            except ValueError:
+                sys.stderr.write(f"rres: {path}:{lineno}: expected 'gpu_type = GB', "
+                                 f"got {line!r}\n")
+    return table
+
 
 # Pending reasons that mean "waiting for resources to free up".  Other reasons
 # (Dependency, QOSMaxGRESPerUser, ...) hold a job back whatever the load is,
@@ -68,19 +84,36 @@ def _norm(name: str) -> str:
     return name.replace("_", "").lower()
 
 
-def gpu_memory_gb(gpu_type: str):
-    """Return the memory of one GPU of the given type in GB, or None if unknown."""
+def gpu_memory_gb(gpu_type: str, features: str = ""):
+    """Return the memory of one GPU of the given type in GB, or None if unknown.
+
+    Looked up in gpu_memory.conf first (by the type name, then without vendor
+    prefixes: an entry "v100" also covers "nvidia_tesla_v100"), then read from
+    the type name, then from the node's `features` (comma separated): one
+    naming the GPU and its size, like "h100_94gb" for "nvidia_h100_nvl".  A
+    feature counts only if its name part occurs in the type, so that a feature
+    like "mem_768gb" is not taken for the GPU's memory.
+    """
+    global _gpu_memory_table
+    if _gpu_memory_table is None:
+        _gpu_memory_table = load_gpu_memory_table()
+    key = _memory_key(gpu_type)
+    while True:  # "nvidia_tesla_v100" -> "teslav100" -> "v100"
+        if key in _gpu_memory_table:
+            return _gpu_memory_table[key]
+        stripped = _VENDOR_PREFIX.sub("", key)
+        if stripped == key:
+            break
+        key = stripped
     sized = re.search(r"(\d+)gi?b", gpu_type.lower())
     if sized:
         return int(sized.group(1))
-    key = re.sub(r"[-_ .]", "", gpu_type.lower())
-    while True:  # "nvidia_tesla_v100" -> "teslav100" -> "v100"
-        if key in GPU_MEMORY_GB:
-            return GPU_MEMORY_GB[key]
-        stripped = _VENDOR_PREFIX.sub("", key)
-        if stripped == key:
-            return None
-        key = stripped
+    key = _memory_key(gpu_type)
+    for feature in features.split(","):
+        tagged = re.fullmatch(r"([a-z0-9_]+?)_?(\d+)gi?b", feature.strip().lower())
+        if tagged and tagged.group(1).replace("_", "") in key:
+            return int(tagged.group(2))
+    return None
 
 
 def slurm_seconds(value: str) -> float:
@@ -225,7 +258,7 @@ def node_records() -> list:
         records.append({
             "node": node,
             "gpu_type": spec["type"],
-            "gpu_mem_gb": gpu_memory_gb(spec["type"]),
+            "gpu_mem_gb": gpu_memory_gb(spec["type"], spec["features"]),
             "partition": spec["partition"],
             "status": st["status"],
             "detail": st["detail"],
@@ -335,7 +368,8 @@ def gpu_summary(records: list = None) -> list:
         usable = [r["gpus_usable"] for r in recs]
         summary.append({
             "gpu_type": gtype,
-            "gpu_mem_gb": gpu_memory_gb(gtype),
+            "gpu_mem_gb": max((r["gpu_mem_gb"] for r in recs if r["gpu_mem_gb"]),
+                              default=None),
             "gpus_free": sum(usable),
             "gpus_free_full_share": sum(r["gpus_full_share"] for r in recs),
             "gpus_total": sum(r["gpus_total"] for r in recs),

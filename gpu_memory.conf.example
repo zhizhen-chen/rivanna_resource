@@ -1,0 +1,18 @@
+# GPU memory per GPU type, in GB, for `rres gpus` (MEM column), `--min-mem`
+# and the web page.  Slurm does not report GPU memory, so rres reads it from
+# this file, then from the type name (a100_80gb), then from node features
+# (h100_94gb); types found in none of them show as "?".
+#
+# To use: cp gpu_memory.conf.example gpu_memory.conf, then edit gpu_memory.conf
+# (it is git-ignored, so `git pull` leaves it alone).
+#
+# Format: one "gpu_type = GB" per line; "#" starts a comment.
+# gpu_type is the GRES type as `rres gpus` shows it (sinfo -o %G).  Case,
+# "_", "-", "." and spaces are ignored, and vendor prefixes (nvidia, tesla,
+# geforce, quadro, amd, instinct) may be left out: "v100" also covers
+# "nvidia_tesla_v100".  An entry here wins over the type name and features.
+#
+# Examples:
+# nvidia_geforce_gtx_1080_ti = 11
+# nvidia_rtx_a4500           = 20
+# a100                       = 80

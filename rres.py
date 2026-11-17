@@ -155,7 +155,10 @@ def cmd_eta(args):
         types = [args.gpu_type] if args.gpu_type else sorted(
             {s[0]["type"] for s in alloc_data.values() if s})
         for gtype in types:
-            if args.min_mem and (rq.gpu_memory_gb(gtype) or 0) < args.min_mem:
+            mem = max((rq.gpu_memory_gb(gtype, s[0]["features"]) or 0
+                       for s in alloc_data.values() if s and s[0]["type"] == gtype),
+                      default=0)
+            if args.min_mem and mem < args.min_mem:
                 continue
             try:
                 script = rq.slurm_template(gtype, alloc_data, free, **_template_kwargs(args))

@@ -1,11 +1,11 @@
 import os
 import html
+import shutil
 from datetime import datetime
 import argparse
 import copy
-import pytz
 from collections import defaultdict
-from subprocess import STDOUT, check_output
+from subprocess import DEVNULL, check_output
 from flask import Flask, Response, render_template_string
 from slurm_gpustat import (
     resource_by_type,
@@ -19,7 +19,10 @@ from slurm_gpustat import (
     avail_stats_for_node,
     parse_node_names,
     get_gpu_partitions,
+    my_identity,
+    default_account,
 )
+import resource_query as rq
 from resource_query import gpu_nodes_with_status, slurm_template
 # import gradio as gr  # Not used in this file
 
@@ -73,6 +76,25 @@ def str_to_int(text):
         return 0
 
 
+def _leaderboard_lines(aggregates):
+    """Format one line per user, heaviest first, listing "type=count" per GPU type.
+
+    Entries take 12 characters, or their length plus two spaces when longer:
+    GRES type names differ in length between clusters
+    (nvidia_rtx_4000_ada_generation), and must not run into each other.
+    """
+    out = ""
+    for user, subdict in sorted(
+        aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
+    ):
+        total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
+        total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
+        entries = [f"{key}={val}" for key, val in sorted(subdict["n_gpu"].items())]
+        summary_str = "".join(f"{e:<{max(12, len(e) + 2)}}" for e in entries).rstrip()
+        out += f"{user:12s}[{total}]    {summary_str}\n"
+    return out
+
+
 def parse_leaderboard(sum_by_gmem=[48]):
     """Request sinfo, parse the leaderboard in string."""
 
@@ -90,19 +112,7 @@ def parse_leaderboard(sum_by_gmem=[48]):
             key: sum([x["bash_gpu"] for x in val.values()])
             for key, val in subdict.items()
         }
-    out = ""
-    for user, subdict in sorted(
-        aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
-    ):
-        total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
-        user_summary = [
-            f"{key}={val}"
-            for key, val in sorted(subdict["n_gpu"].items(), key=lambda x: x[0])
-        ]
-        summary_str = "".join([f"{i:12s}" for i in user_summary])
-        total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
-        out += f"{user:12s}[{total}]    {summary_str}\n"
-    return out
+    return _leaderboard_lines(aggregates)
 
 
 def parse_leaderboard_by_partition(sum_by_gmem=[48]):
@@ -127,17 +137,7 @@ def parse_leaderboard_by_partition(sum_by_gmem=[48]):
         if i != 0:
             out += "-" * 64 + "\n"
         out += f"PARTITION: {part}\n"
-        for user, subdict in sorted(
-            aggregates.items(), key=lambda x: sum(x[1]["n_gpu"].values()), reverse=True
-        ):
-            total = f"total={str(sum(subdict['n_gpu'].values())):2s}"
-            user_summary = [
-                f"{key}={val}"
-                for key, val in sorted(subdict["n_gpu"].items(), key=lambda x: x[0])
-            ]
-            summary_str = "".join([f"{i:12s}" for i in user_summary])
-            total += f"|bash={str(sum(subdict['bash_gpu'].values())):2s}"
-            out += f"{user:12s}[{total}]    {summary_str}\n"
+        out += _leaderboard_lines(aggregates)
     out += "=" * 64 + "\n"
     return out
 
@@ -420,137 +420,33 @@ def parse_usage_to_table(show_bar=True):
     return total_summary + "".join(type_blocks)
 
 
-def parse_disk_io():
-    """Measure disk reading speed, parse the output to a html table.
-
-    Pre-requisite: create a byte file by running
-    `dd if=/dev/zero of=/your/path/test.img bs=512MB count=1 oflag=dsync`."""
-
-    # return '<p>Under maintenance. </p>'
-
-    try:
-        beegfs_ultra_read = check_output(
-            "dd if=/scratch/shared/beegfs/shared-datasets/test/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        beegfs_ultra_read = beegfs_ultra_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        beegfs_ultra_read = "N/A"
-
-    try:
-        beegfs_fast_read = check_output(
-            "dd if=/scratch/shared/beegfs/htd/DATA/tmp/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        beegfs_fast_read = beegfs_fast_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        beegfs_fast_read = "N/A"
-
-    try:
-        beegfs_normal_read = check_output(
-            "dd if=/scratch/shared/beegfs/htd/tmp/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        beegfs_normal_read = beegfs_normal_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        beegfs_normal_read = "N/A"
-
-    try:
-        work_normal_read = check_output(
-            "dd if=/work/htd/Desktop_tmp/tmp/test.img of=/dev/null bs=512MB count=1 oflag=dsync",
-            stderr=STDOUT,
-            shell=True,
-        ).decode("utf-8")
-        work_normal_read = work_normal_read.split("\n")[-2].split(",")[-1].strip()
-    except:
-        work_normal_read = "N/A"
-
-    summary = (
-        "<tr> <td><b>{}</b></td> <td><b>{}</b></td> <td><b>{}</b></td> </tr>".format(
-            "Disk", "Type", "Read Speed"
-        )
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td> </tr>".format(
-        "/beegfs/shared-datasets <i>[ultra-fast-layer]</i>",
-        "NVMe flash",
-        beegfs_ultra_read,
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td> </tr>".format(
-        "/beegfs <i>[fast-layer]</i>", "SSD flash", beegfs_fast_read
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td> </tr>".format(
-        "/beegfs <i>[normal-layer]</i>", "HDD", beegfs_normal_read
-    )
-    summary += "<tr> <td>{}</td> <td>{}</td> <td>{}</td></tr>".format(
-        "/work", "HDD", work_normal_read
-    )
-    table_html = f"<table>{summary}</table>"
-
-    return table_html
-
-
 def parse_disk_quota():
-    """Run 'hdquota' command and parse the output to an HTML table."""
+    """Render the user's storage quotas (`hdquota`) as an HTML table.
+
+    `hdquota` is a site tool of UVA Research Computing.  Where it is missing an
+    empty string is returned, and the page hides the panel.
+    """
     try:
-        output = check_output("hdquota", shell=True).decode("utf-8")
-        lines = output.split('\n')
-        
-        # Create HTML table with headers
-        headers = ["Storage Type", "Location", "Size", "Used", "Avail", "Use%"]
-        table_html = "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
-        
-        # Add data rows
-        for line in lines[2:]:  # Skip header and separator lines
-            if not line.strip():
-                continue
-            
-            # Split the line into parts, handling spaces correctly
-            parts = line.split()
-            
-            # Skip lines that don't have enough parts
-            if len(parts) < 9:  # Changed from 10 to 9 to handle single-word storage types
-                continue
-                
-            try:
-                # Handle storage type (could be one or two words)
-                if parts[1] in ["Directory", "Project", "Standard"]:
-                    storage_type = f"{parts[0]} {parts[1]}"
-                    location = parts[2]
-                    size = f"{parts[3]} {parts[4]}"
-                    used = f"{parts[5]} {parts[6]}"
-                    avail = f"{parts[7]} {parts[8]}"
-                    use_percent = parts[9]
-                else:
-                    storage_type = parts[0]
-                    location = parts[1]
-                    size = f"{parts[2]} {parts[3]}"
-                    used = f"{parts[4]} {parts[5]}"
-                    avail = f"{parts[6]} {parts[7]}"
-                    use_percent = parts[8]
-                
-                table_html += "<tr>"
-                table_html += f"<td>{storage_type}</td>"
-                table_html += f"<td>{location}</td>"
-                table_html += f"<td>{size}</td>"
-                table_html += f"<td>{used}</td>"
-                table_html += f"<td>{avail}</td>"
-                table_html += f"<td>{use_percent}</td>"
-                table_html += "</tr>"
-            except IndexError:
-                continue
-        
-        table_html += "</table>"
-        return table_html
+        rows = rq.disk_quota()
     except Exception as e:
-        error_msg = f"Error getting disk quota information: {str(e)}"
-        return f"<p>{error_msg}</p>"
+        return f"<p>Error getting disk quota information: {html.escape(str(e))}</p>"
+    if rows is None:
+        return ""
+    if not rows:
+        return "<p>No quota information found.</p>"
+    headers = ["Storage Type", "Location", "Size", "Used", "Avail", "Use%"]
+    keys = ["storage", "location", "size", "used", "available"]
+    table_html = "<table><tr>" + "".join(f"<th>{h}</th>" for h in headers) + "</tr>"
+    for row in rows:
+        cells = [html.escape(str(row[k])) for k in keys] + [f"{row['use_percent']}%"]
+        table_html += "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+    return table_html + "</table>"
 
 
 def get_my_accounts():
     """Return the list of accounts the current user belongs to via 'allocations'."""
+    if not shutil.which("allocations"):
+        return []
     try:
         raw = parse_cmd("allocations", split=False)
     except Exception:
@@ -566,7 +462,7 @@ def get_my_accounts():
 def parse_allocation_for_account(account):
     """Parse 'allocations -a <account>' and return an HTML block for that account."""
     try:
-        raw = check_output(f"allocations -a {account}", shell=True).decode("utf-8")
+        raw = check_output(["allocations", "-a", account], stderr=DEVNULL).decode("utf-8")
     except Exception:
         return f"<p>Error fetching allocation for {account}.</p>"
 
@@ -636,11 +532,26 @@ def parse_allocation_for_account(account):
 
 
 def parse_allocations_to_table():
-    """Dynamically discover accounts and render allocation tables for each."""
-    accounts = get_my_accounts()
+    """Render the user's allocations, with balances where the site reports them.
+
+    With UVA's `allocations` tool each account gets its balance and members.
+    Elsewhere the user's Slurm accounts (from sacctmgr) are listed without
+    balances, and without accounting data an empty string hides the panel.
+    """
+    if shutil.which("allocations"):
+        accounts = get_my_accounts()
+        if not accounts:
+            return "<p>No allocations found.</p>"
+        return "".join(parse_allocation_for_account(acc) for acc in accounts)
+    accounts = sorted(my_identity()[1])
     if not accounts:
-        return "<p>No allocations found.</p>"
-    return "".join(parse_allocation_for_account(acc) for acc in accounts)
+        return ""
+    default = default_account()
+    rows = "".join(
+        f"<tr><td>{html.escape(a)}</td><td>{'default' if a == default else ''}</td></tr>"
+        for a in accounts)
+    return ("<table><tr><th>Slurm account</th><th></th></tr>" + rows + "</table>"
+            "<p>Balances are not available on this cluster.</p>")
 
 
 def main():
@@ -662,7 +573,7 @@ def main():
     @app.route("/time_feed")
     def time_feed():
         def generate():
-            yield f'updated at: {datetime.now(pytz.timezone("America/New_York")).strftime("%Y.%m.%d | %H:%M:%S")}'
+            yield f'updated at: {datetime.now().astimezone().strftime("%Y.%m.%d | %H:%M:%S %Z")}'
 
         return Response(generate(), mimetype="text")
 

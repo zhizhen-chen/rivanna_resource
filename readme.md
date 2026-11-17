@@ -74,8 +74,10 @@ otherwise the `rivanna_resource` conda env, otherwise `python3`.
 Slurm client commands. Site-specific pieces degrade gracefully: without UVA's
 `allocations`, `rres accounts` lists your Slurm accounts without balances; without
 `hdquota`, `rres quota` says so; without `sacctmgr`, templates omit `--account`.
-GPU memory per type comes from the type name (`a100_80gb`, `1g.24gb`) or a built-in
-table; override or extend it with e.g. `RRES_GPU_MEMORY="a100=80,v100=16"`.
+Slurm does not report GPU memory: rres reads it from `gpu_memory.conf` if present
+(`cp gpu_memory.conf.example gpu_memory.conf` and fill in `gpu_type = GB` lines),
+else from the type name (`a100_80gb`, `1g.24gb`) or a node feature (`h100_94gb`);
+other types show `?`.
 
 ## Credits
 This project is based on the original `slurm_gpustat` tool developed by [Samuel Albanie](https://github.com/albanie/slurm_gpustat) and `slurm_web
