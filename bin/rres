@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Entry point of rres (see rres.py, or run `rres --help`).
+# Uses $RRES_PYTHON, else the project's conda env, else python3 on PATH.
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+py="${RRES_PYTHON:-}"
+if [ -z "$py" ]; then
+    if [ -x "$HOME/.conda/envs/rivanna_resource/bin/python" ]; then
+        py="$HOME/.conda/envs/rivanna_resource/bin/python"
+    else
+        py=python3
+    fi
+fi
+exec "$py" "$here/rres.py" "$@"

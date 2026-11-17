@@ -18,6 +18,7 @@ import time
 import atexit
 import signal
 import argparse
+import shutil
 import functools
 import subprocess
 from typing import Optional
@@ -25,13 +26,36 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, Counter
 
-import numpy as np
-import colored
-# import seaborn as sns  # Not used in this file
-import humanize
-import humanfriendly as hf
-from beartype import beartype
-from django.utils.functional import lazy
+# Third-party packages are optional, so that the command line tool (rres) runs on
+# any Slurm cluster with a bare python3.  The web app and the daemon still want
+# them installed (requirements.txt); `colored` is imported where it is used.
+try:
+    import humanfriendly as hf
+except ImportError:
+    hf = None
+try:
+    from beartype import beartype
+except ImportError:
+    def beartype(func):
+        return func
+
+_SIZE_UNITS = {"": 0, "K": 1, "M": 2, "G": 3, "T": 4, "P": 5, "E": 6}
+
+
+def parse_size(value: str, binary: bool = True) -> float:
+    """Parse a size such as "257000M", "1.5T" or "512 GiB" into bytes.
+
+    Uses humanfriendly when it is installed, otherwise this stdlib parser, which
+    covers the amounts SLURM prints (a number with an optional K/M/G/T/P suffix).
+    A bare number is taken as bytes, as humanfriendly does.
+    """
+    if hf is not None:
+        return hf.parse_size(value, binary=binary)
+    match = re.fullmatch(r"\s*([\d.]+)\s*([KMGTPE]?)(?:i?B)?\s*", str(value), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"cannot parse size {value!r}")
+    base = 1024 if binary else 1000
+    return float(match.group(1)) * base ** _SIZE_UNITS[match.group(2).upper()]
 
 
 # Whether a node can take a job is decided from the `State=` field of `scontrol
@@ -287,11 +311,11 @@ def historical_summary(data):
         print(f"GPU usage for {user}:")
         total = 0
         for gpu_type, counts in subdict.items():
-            counts = np.array(counts)
-            if counts.sum() == 0:
+            if sum(counts) == 0:
                 continue
-            print(f"{gpu_type:5s} > avg: {int(counts.mean())}, max: {np.max(counts)}")
-            total += counts.mean()
+            mean = sum(counts) / len(counts)
+            print(f"{gpu_type:5s} > avg: {int(mean)}, max: {max(counts)}")
+            total += mean
         print(f"total > avg: {int(total)}\n")
 
 
@@ -402,20 +426,16 @@ def lru_cache_time(seconds, maxsize=None):
     https://stackoverflow.com/questions/31771286/python-in-memory-cache-with-time-to-live
     """
     def wrapper(func):
-        # Lazy function that makes sure the lru_cache() invalidate after X secs
-        ttl_hash = lazy(lambda: round(time.time() / seconds), int)()
-        
         @functools.lru_cache(maxsize)
-        def time_aware(__ttl, *args, **kwargs):
-            """
-            Main wrapper, note that the first argument ttl is not passed down. 
-            This is because no function should bother to know this that 
-            this is here.
-            """
-            def wrapping(*args, **kwargs):
-                return func(*args, **kwargs)
-            return wrapping(*args, **kwargs)
-        return functools.update_wrapper(functools.partial(time_aware, ttl_hash), func)
+        def time_aware(_ttl_hash, *args, **kwargs):
+            # _ttl_hash only keys the cache: it changes every `seconds`, so
+            # entries older than that are never hit again.
+            return func(*args, **kwargs)
+
+        @functools.wraps(func)
+        def cached(*args, **kwargs):
+            return time_aware(round(time.time() / seconds), *args, **kwargs)
+        return cached
     return wrapper
 
 
@@ -445,10 +465,12 @@ def my_identity() -> tuple:
     global _IDENTITY
     if _IDENTITY is None:
         user = getpass.getuser()
-        try:
-            rows = parse_cmd(f"sacctmgr -nP show assoc user={user} format=account")
-        except Exception:
-            rows = []
+        rows = []
+        if shutil.which("sacctmgr"):  # absent where accounting is not set up
+            try:
+                rows = parse_cmd(f"sacctmgr -nP show assoc user={user} format=account")
+            except Exception:
+                pass
         accounts = frozenset(r.strip().lower() for r in rows if r.strip())
         groups = set()
         for gid in os.getgroups():
@@ -461,6 +483,22 @@ def my_identity() -> tuple:
 
 
 _IDENTITY = None
+
+
+@functools.lru_cache(maxsize=None)
+def default_account() -> Optional[str]:
+    """Return the user's default SLURM account (sacctmgr DefaultAccount), if any.
+
+    sbatch charges this account when none is given, so a template can rely on it
+    when the user has several accounts.
+    """
+    if not shutil.which("sacctmgr"):
+        return None
+    try:
+        rows = parse_cmd(f"sacctmgr -nP show user {getpass.getuser()} format=defaultaccount")
+    except Exception:
+        return None
+    return next((r.strip().lower() for r in rows if r.strip()), None)
 
 
 def _matches_acl(spec: str, mine) -> Optional[bool]:
@@ -521,7 +559,8 @@ def node_availability() -> dict:
 
     Returns:
         node name -> {"status": one of UP, OWN_RESV, DRAINING, RESERVED, MAINT,
-        DOWN; "detail": a human readable explanation of that status}.
+        DOWN; "detail": a human readable explanation of that status; "state": the
+        raw `State=` of `scontrol show node`, e.g. "MIXED+PLANNED"}.
     """
     reservations = active_reservations()
     result = {}
@@ -555,7 +594,7 @@ def node_availability() -> dict:
             status, detail = RESERVED, f"held by reservation {names}, which you may not use"
         else:
             status, detail = UP, state
-        result[node] = {"status": status, "detail": detail}
+        result[node] = {"status": status, "detail": detail, "state": state}
     return result
 
 
@@ -614,8 +653,8 @@ def occupancy_stats_for_node(node: str) -> dict:
             # like 68G/257669M, rather than 68G/258G. The humanfriendly library provides
             # a more reliable number parser, and the humanize library provides a nice
             # formatter.
-            alloc_val = format_size(hf.parse_size(alloc_val,binary=True))
-            cfg_val = format_size(hf.parse_size(cfg_val,binary=True))
+            alloc_val = format_size(parse_size(alloc_val,binary=True))
+            cfg_val = format_size(parse_size(cfg_val,binary=True))
         occupancy[metric] = f"{alloc_val}/{cfg_val}"
     return occupancy
 
@@ -683,11 +722,11 @@ def avail_stats_for_node(node: str) -> dict:
             # like 68G/257669M, rather than 68G/258G. The humanfriendly library provides
             # a more reliable number parser, and the humanize library provides a nice
             # formatter.
-            avail_val = format_size(hf.parse_size(cfg_val,binary=True) - hf.parse_size(alloc_val,binary=True))
-            cfg_val = format_size(hf.parse_size(cfg_val,binary=True))
+            avail_val = format_size(parse_size(cfg_val,binary=True) - parse_size(alloc_val,binary=True))
+            cfg_val = format_size(parse_size(cfg_val,binary=True))
             occupancy[metric] = f"{avail_val} / {cfg_val}"
         else:
-            occupancy[metric] = f"{hf.parse_size(cfg_val)-hf.parse_size(alloc_val)} / {hf.parse_size(cfg_val)}"
+            occupancy[metric] = f"{parse_size(cfg_val)-parse_size(alloc_val)} / {parse_size(cfg_val)}"
     return occupancy
 
 
@@ -787,7 +826,7 @@ def gpu_alloc_by_node() -> dict:
             elif item.startswith("mem="):
                 mem_str = item.split("=", 1)[1]
                 try:
-                    mem_total_mb = int(hf.parse_size(mem_str, binary=True) // (1024 * 1024))
+                    mem_total_mb = int(parse_size(mem_str, binary=True) // (1024 * 1024))
                 except Exception:
                     pass
 
@@ -937,24 +976,17 @@ def gpu_usage(resources: dict, partition: Optional[str] = None) -> dict:
     Returns:
         (dict): a summary of resources organised by user (and also by node name).
     """
-    version_cmd = "sinfo -V"
-    slurm_version = parse_cmd(version_cmd, split=False).split(" ")[1]
-    if slurm_version.startswith("17"):
-        resource_flag = "gres"
-    else:
-        resource_flag = "tres-per-node"
-
-    if int(slurm_version[0:2]) >= 21:
-        gpu_identifier = 'gres/gpu'
-    else:
-        gpu_identifier = 'gpu'
-
+    # GPU counts come from the job's allocated TRES ("...,gres/gpu=8"), which is
+    # filled in however the GPUs were requested.  tres-per-node only reflects
+    # --gres / --gpus-per-node, so jobs submitted with --gpus or --gpus-per-task
+    # showed "N/A" there and their users vanished from the page.
+    #
     # The submitted command comes straight from squeue: asking `scontrol show
     # jobid` about every job instead meant hundreds of subprocess calls per page.
     # Fixed-width columns (rather than splitting on whitespace) keep the command
     # intact when its path contains spaces.
-    columns = [(resource_flag, 100), ("nodelist", 300), ("username", 100),
-               ("command", 300)]
+    columns = [("tres-alloc", 300), ("numnodes", 10), ("nodelist", 300),
+               ("username", 100), ("command", 300)]
     fmt = ",".join(f"{name}:{width}" for name, width in columns)
     args = f"-O {fmt} --noheader"
     if partition:
@@ -968,14 +1000,14 @@ def gpu_usage(resources: dict, partition: Optional[str] = None) -> dict:
         for _, width in columns:
             values.append(row[offset:offset + width].strip())
             offset += width
-        gpu_count_str, node_str, user, command = values
+        tres_alloc, num_nodes, node_str, user, command = values
+        match = re.search(r"(?:^|,)gres/gpu=(\d+)", tres_alloc)
         # ignore pending jobs (no nodelist) or non-GPU jobs
-        if not node_str or not gpu_count_str.startswith(gpu_identifier):
+        if not node_str or not match:
             continue
-        gpu_count_tokens = gpu_count_str.split(":")
-        if not gpu_count_tokens[-1].isdigit():
-            gpu_count_tokens.append("1")
-        num_gpus = int(gpu_count_tokens[-1])
+        # The allocation is the job's total; SLURM spreads GPUs evenly per node.
+        num_nodes = int(num_nodes) if num_nodes.isdigit() and int(num_nodes) > 0 else 1
+        num_gpus = int(match.group(1)) // num_nodes
         # Match on the basename so that "/bin/bash" counts as interactive too.
         is_bash = os.path.basename(command) in INTERACTIVE_CMDS
         for node_name in parse_node_names(node_str):
@@ -1092,6 +1124,7 @@ def all_info(color: int, verbose: bool, partition: Optional[str] = None):
     # Use only verified color names from `colored` library
     colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "black"]
     if color:
+        import colored
         divider = colored.fg(colors[7]) + divider + colored.attr("reset")
         slurm_str = colored.fg(colors[0]) + slurm_str + colored.attr("reset")
     print(divider)

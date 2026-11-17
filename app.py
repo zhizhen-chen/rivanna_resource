@@ -11,17 +11,16 @@ from slurm_gpustat import (
     resource_by_type,
     parse_all_gpus,
     gpu_usage,
-    gpu_alloc_by_node,
     node_availability,
     ACCEPTS_JOBS,
     UP,
-    DOWN,
     parse_cmd,
     parse_squeue,
     avail_stats_for_node,
     parse_node_names,
     get_gpu_partitions,
 )
+from resource_query import gpu_nodes_with_status, slurm_template
 # import gradio as gr  # Not used in this file
 
 # Tags shown next to a node that does not simply accept jobs from everyone.
@@ -290,110 +289,13 @@ def parse_cpu_usage_to_table(partition="compute", show_bar=True):
     return table_html
 
 
-def build_slurm_template(gpu_type: str, alloc_data: dict) -> str:
-    """Generate a SBATCH script header for the given GPU type.
-
-    Picks the representative node (most common config) and fills in
-    partition, constraint/feature, GPU name, and per-node CPU/mem totals.
-    Values the user should customise (num GPUs, CPUs, mem, time) are left
-    with placeholder comments so the intent is obvious.
-    """
-    nodes = [
-        specs[0] for specs in alloc_data.values()
-        if specs and specs[0]["type"] == gpu_type
-    ]
-    if not nodes:
-        return f"# No nodes found for GPU type: {gpu_type}"
-
-    # Use first node as representative (they share the same hardware config)
-    rep = nodes[0]
-    partition = rep.get("partition", "gpu")
-    features = rep.get("features", gpu_type)
-    active_features = rep.get("active_features", features)
-    cpu_total = rep.get("cpu_total", 0)
-    mem_total_mb = rep.get("mem_total_mb", 0)
-    gpu_total = rep.get("total", 1)
-
-    # ActiveFeatures is what SLURM enforces for --constraint; pick the most
-    # specific tag (longest) that matches the gpu_type by normalised comparison
-    # (ignoring underscores), so e.g. "rtxpro6000" is chosen for gpu_type
-    # "rtx_pro_6000", and "a100_80gb" is chosen over "a100" for 80 GB nodes.
-    active_feature_list = [f.strip() for f in active_features.split(",") if f.strip()]
-    gpu_type_norm = gpu_type.replace("_", "")
-    matching_features = [f for f in active_feature_list
-                         if f.replace("_", "") == gpu_type_norm
-                         or gpu_type_norm.startswith(f.replace("_", ""))]
-    constraint_tag = max(matching_features, key=len) if matching_features else gpu_type
-
-    # Derive the base gres name from AvailableFeatures: if it contains the bare
-    # GPU name without a variant suffix, use that; otherwise use gpu_type.
-    # e.g. features="a100,a100_80gb,gpupod" -> gres_name="a100"
-    feature_list = [f.strip() for f in features.split(",") if f.strip()]
-    bare_candidates = [f for f in feature_list
-                       if gpu_type.startswith(f + "_") or f == gpu_type.split("_")[0]]
-    gres_name = bare_candidates[0] if bare_candidates else gpu_type
-
-    mem_per_gpu_gb = (mem_total_mb // 1024) // gpu_total if gpu_total else 0
-    cpu_per_gpu = cpu_total // gpu_total if gpu_total else 0
-
-    lines = [
-        "#!/bin/bash",
-        f"#SBATCH --partition={partition}",
-        f"#SBATCH --gres=gpu:{gres_name}:1          # number of GPUs (max {gpu_total} per node)",
-        f"#SBATCH --constraint={constraint_tag}",
-        f"#SBATCH --cpus-per-task={cpu_per_gpu}    # CPUs per GPU (max {cpu_total} per node)",
-        f"#SBATCH --mem={mem_per_gpu_gb}G           # memory per job (max {mem_total_mb // 1024}G per node)",
-        "#SBATCH --time=1-00:00:00                  # wall time (D-HH:MM:SS)",
-        "#SBATCH --account=<your_account>           # your Slurm account/allocation",
-        "#SBATCH --job-name=my_job",
-        "#SBATCH --output=%x-%j.out",
-        "",
-        "# ---- load modules / activate environment ----",
-        "module purge",
-        "# module load cuda/12.x",
-        "",
-        "# ---- your commands ----",
-        "python train.py",
-    ]
-    return "\n".join(lines)
-
-
-def gpu_nodes_with_status():
-    """Return the GPU nodes worth showing, with each one's status and free GPUs.
-
-    A node the current user cannot start a job on counts zero free GPUs and is
-    shown greyed out, tagged with the reason (draining, reserved, maint), so that
-    it is clear why its GPUs cannot be had.  Nodes that are down or drained are
-    dropped, unless jobs still run on them, which would otherwise vanish from the
-    page.
-
-    Returns:
-        (alloc_data, status, free): gpu_alloc_by_node() restricted to those nodes,
-        node -> node_availability() entry, and node -> number of free GPUs.
-    """
-    alloc_data = gpu_alloc_by_node()
-    availability = node_availability()
-    status = {
-        node: availability.get(node, {"status": DOWN, "detail": "unknown to scontrol"})
-        for node in alloc_data
-    }
-    alloc_data = {
-        node: specs
-        for node, specs in alloc_data.items()
-        if status[node]["status"] != DOWN or any(s["alloc"] for s in specs)
-    }
-    free = {
-        node: sum(max(s["total"] - s["alloc"], 0) for s in specs)
-        if status[node]["status"] in ACCEPTS_JOBS else 0
-        for node, specs in alloc_data.items()
-    }
-    return alloc_data, status, free
-
-
 def get_slurm_template_json(gpu_type: str) -> dict:
     """Return the SBATCH template and node-count info for a GPU type as a dict."""
     alloc_data, _, free = gpu_nodes_with_status()
-    template = build_slurm_template(gpu_type, alloc_data)
+    try:
+        template = slurm_template(gpu_type, alloc_data, free)
+    except ValueError as e:
+        template = f"# {e}"
     nodes = [n for n, s in alloc_data.items() if s and s[0]["type"] == gpu_type]
     avail = sum(free[n] for n in nodes)
     total = sum(alloc_data[n][0]["total"] for n in nodes)
