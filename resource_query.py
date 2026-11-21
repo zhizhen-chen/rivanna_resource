@@ -398,8 +398,9 @@ def slurm_template(gpu_type: str, alloc_data: dict = None, free: dict = None, *,
     """Generate an SBATCH script for the given GPU type.
 
     The node of that type with the most free GPUs stands for the type: its
-    partition and hardware (CPUs and memory per GPU) fill in the defaults.  CPUs
-    and memory default to that node's share per GPU times `gpus`, the wall time
+    partition and hardware (CPUs per GPU) fill in the defaults.  CPUs default to
+    that node's share per GPU times `gpus`; memory is requested only when
+    `mem_gb` is given (otherwise SLURM's default applies); the wall time
     to DEFAULT_TIME capped at the partition's limit, and the account to the
     user's only account, if they have exactly one.
 
@@ -434,10 +435,9 @@ def slurm_template(gpu_type: str, alloc_data: dict = None, free: dict = None, *,
         raise ValueError(f"{gpu_type} nodes have {gpu_total} GPUs each; "
                          f"use --nodes for more than that")
     cpus = cpus if cpus is not None else max(cpu_total // gpu_total, 1) * gpus
-    mem_gb = mem_gb if mem_gb is not None else (mem_total_gb // gpu_total) * gpus
     if cpus > cpu_total:
         raise ValueError(f"{gpu_type} nodes have {cpu_total} CPUs each")
-    if mem_gb > mem_total_gb:
+    if mem_gb is not None and mem_gb > mem_total_gb:
         raise ValueError(f"{gpu_type} nodes have {mem_total_gb}G of memory each")
 
     max_time = parts.get(part, {}).get("max_time", "")
@@ -473,15 +473,11 @@ def slurm_template(gpu_type: str, alloc_data: dict = None, free: dict = None, *,
                 if _norm(f) == _norm(gpu_type) or _norm(gpu_type).startswith(_norm(f))]
     constraint = max(matching, key=len) if matching else None
 
-    # Derive the base gres name from AvailableFeatures: if it contains the bare
-    # GPU name without a variant suffix, use that; otherwise use gpu_type.
-    # e.g. features="a100,a100_80gb,gpupod" -> gres_name="a100"
-    features = [f.strip() for f in rep.get("features", "").split(",") if f.strip()]
-    bare = [f for f in features
-            if gpu_type.startswith(f + "_") or f == gpu_type.split("_")[0]]
-    gres_name = bare[0] if bare else gpu_type
-    # Nodes whose Gres has no type ("gpu:4") take an untyped request.
-    gres = f"gpu:{gpus}" if gpu_type == "unknown" else f"gpu:{gres_name}:{gpus}"
+    # --gres takes the node's own Gres type (e.g. "a100"), not the display name
+    # (e.g. "a100_80gb", which the --constraint above selects).  Nodes whose
+    # Gres has no type ("gpu:4") take an untyped request.
+    gres_name = rep.get("gres_name")
+    gres = f"gpu:{gres_name}:{gpus}" if gres_name else f"gpu:{gpus}"
 
     lines = ["#!/bin/bash", f"#SBATCH --partition={part}"]
     if nodes > 1:
@@ -494,7 +490,10 @@ def slurm_template(gpu_type: str, alloc_data: dict = None, free: dict = None, *,
         lines.append(f"#SBATCH --constraint={constraint}")
     lines += [
         f"#SBATCH --cpus-per-task={cpus}    # CPUs (max {cpu_total} per node)",
-        f"#SBATCH --mem={mem_gb}G           # memory per node (max {mem_total_gb}G)",
+    ]
+    if mem_gb is not None:
+        lines.append(f"#SBATCH --mem={mem_gb}G           # memory per node (max {mem_total_gb}G)")
+    lines += [
         f"#SBATCH --time={time}                  "
         f"# wall time (D-HH:MM:SS, max {max_time or 'unknown'} on {part})",
     ]
