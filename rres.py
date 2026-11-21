@@ -88,7 +88,7 @@ def cmd_gpus(args):
         ])
         print("\nFREE counts GPUs on nodes that accept your jobs and still have CPU and "
               "memory left;\nFULL_SHARE those that still come with their share of the "
-              "node's CPUs and memory\n(what `rres template` asks for by default).\nQUEUED = pending GPU jobs waiting for resources that could run "
+              "node's CPUs and memory\n(`rres template` asks for the CPU share by default).\nQUEUED = pending GPU jobs waiting for resources that could run "
               "on the type.\nFree GPUs do not mean an immediate start: run `rres eta` for "
               "the scheduler's estimate.")
     _emit(args, summary, show)
@@ -255,7 +255,7 @@ def build_parser():
     g.add_argument("--gpus", type=int, default=1, help="GPUs per node (default: 1)")
     g.add_argument("--nodes", type=int, default=1, help="number of nodes (default: 1)")
     g.add_argument("--cpus", type=int, help="CPUs per task (default: the node's share per GPU x GPUs)")
-    g.add_argument("--mem", type=int, metavar="GB", help="memory per node in GB (default: the node's share per GPU x GPUs)")
+    g.add_argument("--mem", type=int, metavar="GB", help="memory per node in GB (default: not requested, Slurm's default applies)")
     g.add_argument("--time", help=f"wall time, D-HH:MM:SS (default: {rq.DEFAULT_TIME}, capped at the partition limit)")
     g.add_argument("--account", help="Slurm account (default: yours, if you have only one)")
     g.add_argument("--partition", help="partition (default: the one holding the node type with the most free GPUs)")

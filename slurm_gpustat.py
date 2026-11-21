@@ -784,6 +784,10 @@ def gpu_alloc_by_node() -> dict:
         if gpu_total == 0:
             continue  # no GPU on this node
 
+        # The Gres type exactly as SLURM knows it: `--gres` must use this name,
+        # not the display name chosen below (None for an untyped "gpu:<count>").
+        gres_name = gpu_type
+
         # For GPU types where the Gres name is generic (e.g. "a100"), use
         # AvailableFeatures to pick the most specific variant tag so that
         # different memory tiers are shown as separate rows in the UI.
@@ -829,9 +833,15 @@ def gpu_alloc_by_node() -> dict:
                     mem_total_mb = int(parse_size(mem_str, binary=True) // (1024 * 1024))
                 except Exception:
                     pass
+        # Memory reserved for the system (MemSpecLimit, in MB) is not available to jobs.
+        try:
+            mem_total_mb = max(mem_total_mb - int(fields.get("MemSpecLimit", 0) or 0), 0)
+        except ValueError:
+            pass
 
         result[node] = [{
             "type": gpu_type if gpu_type else "unknown",
+            "gres_name": gres_name,
             "alloc": gpu_alloc,
             "total": gpu_total,
             "partition": fields.get("Partitions", "gpu"),
